@@ -1,0 +1,961 @@
+#!/usr/bin/env bash
+# ai-review — orchestrator for a multi-reviewer PR pipeline.
+#
+# Reviewer discovery:
+#   1. <repo>/.ai-review/reviewers/*.sh   (project overrides, by basename)
+#   2. ~/.local/share/ai-review/reviewers.default/*.sh (global)
+#
+# Pipeline stages:
+#   1. Each enabled reviewer (sequential, scoped tool surface)
+#   2. extract-line-findings.sh  → JSON of line-anchored findings
+#   3. consolidate-summary.sh    → prose summary
+#   4. post-review.sh            → atomic POST to GitHub Reviews API
+#
+# Identity:
+#   - "app"     ─ requires ~/.config/ai-review/apps/<owner>__<repo>.{conf,pem}
+#   - "gh-user" ─ posts under the local `gh` login
+#   - "auto"    ─ App if configured for this repo, else gh-user
+#
+# Config precedence:
+#   env  >  <repo>/.ai-review/config  >  ~/.config/ai-review/config  >  defaults
+#
+# Usage:
+#   ai-review                        # full PR-review pipeline
+#   ai-review --audit                # whole-repo audit → local markdown report
+#   ai-review --init                 # interactive project setup
+#   ai-review --include foo,bar      # add these
+#   ai-review --exclude runtime-test # skip these
+#   ai-review --only correctness     # ONLY this one
+#   ai-review --list                 # show discovered reviewers
+#   ai-review --status               # last 3 runs per repo (default)
+#   ai-review --status 10            # last 10 runs per repo
+#   ai-review --status all           # every recorded run
+#   ai-review --quick                # skip stages 2/3, single summary
+#   ai-review --keep                 # preserve /tmp run dir
+#
+# Reviewer interface: each script exposes
+#   <script> applies   # exit 0 iff this reviewer should run for the PR
+#   <script> run       # produce $RUN_DIR/stage1/<NAME>.md
+
+set -euo pipefail
+
+SHARE="${AI_REVIEW_SHARE:-$HOME/.local/share/ai-review}"
+LIB="$SHARE/lib/common.sh"
+GLOBAL_CONF="${AI_REVIEW_CONFIG:-$HOME/.config/ai-review/config}"
+APPS_DIR="${AI_REVIEW_APPS_DIR:-$HOME/.config/ai-review/apps}"
+STATE_DIR="${AI_REVIEW_STATE_DIR:-$HOME/.local/state/ai-review/runs}"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+# ------------------------------------------------------------------
+# Args.
+# ------------------------------------------------------------------
+INCLUDE=""
+EXCLUDE=""
+ONLY=""
+LIST=false
+QUICK=false
+KEEP=false
+INIT=false
+STATUS=false
+STATUS_LIMIT=3
+AUDIT=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --include) INCLUDE="$2"; shift 2 ;;
+    --exclude) EXCLUDE="$2"; shift 2 ;;
+    --only)    ONLY="$2"; shift 2 ;;
+    --list)    LIST=true; shift ;;
+    --quick)   QUICK=true; shift ;;
+    --keep)    KEEP=true; shift ;;
+    --init)    INIT=true; shift ;;
+    --audit)   AUDIT=true; shift ;;
+    --status)
+      STATUS=true; shift
+      if [ $# -gt 0 ]; then
+        case "$1" in
+          all|[0-9]*) STATUS_LIMIT="$1"; shift ;;
+        esac
+      fi
+      ;;
+    -h|--help)
+      sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if $QUICK && $AUDIT; then
+  echo "ai-review: --quick and --audit cannot be combined." >&2
+  echo "  --quick posts a PR comment; --audit writes a local file." >&2
+  exit 2
+fi
+
+# ------------------------------------------------------------------
+# --status: show recent / running ai-review runs across all repos.
+# ------------------------------------------------------------------
+if $STATUS; then
+  python3 - "$STATE_DIR" "$STATUS_LIMIT" <<'PY'
+import os, sys, time, glob
+from collections import defaultdict
+
+state_dir = sys.argv[1]
+limit_arg = sys.argv[2]
+limit = None if limit_arg == "all" else int(limit_arg)
+
+files = sorted(glob.glob(os.path.join(state_dir, "*.run")), key=os.path.getmtime, reverse=True)
+if not files:
+    print("(no runs recorded)")
+    sys.exit(0)
+
+def load_run(p):
+    d = {}
+    for line in open(p):
+        if "=" in line:
+            k, v = line.rstrip("\n").split("=", 1)
+            d[k] = v
+    return d
+
+def load_tasks(p):
+    """Return list of (name, start, end, exit, bytes)."""
+    if not os.path.exists(p):
+        return []
+    out = []
+    for line in open(p):
+        parts = line.rstrip("\n").split("|")
+        if len(parts) >= 5:
+            try:
+                out.append((parts[0], int(parts[1]), int(parts[2]),
+                            int(parts[3]), int(parts[4])))
+            except Exception:
+                pass
+    return out
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0); return True
+    except Exception:
+        return False
+
+def fmt_dur(s):
+    if s is None: return "?"
+    try: s = int(s)
+    except: return "?"
+    if s < 60: return f"{s}s"
+    if s < 3600: return f"{s//60}m{s%60:02d}"
+    return f"{s//3600}h{(s%3600)//60:02d}"
+
+def fmt_bytes(b):
+    if b < 1024: return f"{b}B"
+    if b < 1024*1024: return f"{b//1024}K"
+    return f"{b//1048576}M"
+
+# Group by (owner, repo); within each group, take last $limit by recency.
+by_repo = defaultdict(list)
+for f in files:
+    d = load_run(f)
+    by_repo[(d.get("owner","?"), d.get("repo","?"))].append((f, d))
+
+# Order groups by most-recent run within each.
+def group_recency(items):
+    return max(int(d.get("started","0") or 0) for _, d in items)
+sorted_groups = sorted(by_repo.items(), key=lambda kv: group_recency(kv[1]), reverse=True)
+
+now = int(time.time())
+HEADER = f"{'REPO':<26}  {'PR':>5}  {'STATUS':<10}  {'STARTED':<16}  {'TOTAL':>6}  LINK"
+print(HEADER)
+print("-" * len(HEADER))
+
+first_group = True
+for (owner, repo), entries in sorted_groups:
+    entries.sort(key=lambda fd: int(fd[1].get("started","0") or 0), reverse=True)
+    if limit is not None:
+        entries = entries[:limit]
+    if not first_group:
+        print()  # blank line between repo groups
+    first_group = False
+    for f, d in entries:
+        tasks = load_tasks(f.replace(".run", ".tasks"))
+        kind = d.get("kind", "pr")
+        pr = "audit" if kind == "audit" else d.get("pr", "?")
+        status = d.get("status", "?")
+        pid_alive = d.get("pid") and alive(d["pid"])
+        if status == "running" and not pid_alive:
+            status = "crashed"
+        started = int(d.get("started", "0") or 0)
+        ended = int(d.get("ended", "0") or 0)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(started)) if started else "?"
+        total = fmt_dur(ended - started) if ended and started else (
+            fmt_dur(now - started) if started and status == "running" else "—")
+        # Audit runs link to the local report file. PR runs prefer the
+        # review-comment URL the post stage captured; fall back to PR URL.
+        review_url = d.get("review_url", "").strip()
+        if kind == "audit":
+            url = review_url or "(no report)"
+        else:
+            pr_url = f"https://github.com/{owner}/{repo}/pull/{pr}" if str(pr).isdigit() and int(pr) > 0 else "(no PR)"
+            url = review_url or pr_url
+        repo_lbl = f"{owner}/{repo}"
+        pr_col = str(pr)
+        print(f"{repo_lbl:<26}  {pr_col:>5}  {status:<10}  {when:<16}  {total:>6}  {url}")
+        for name, ts, te, ec, bts in tasks:
+            elapsed = fmt_dur(te - ts)
+            mark = "✓" if ec == 0 else f"✗ exit {ec}"
+            print(f"    ↳ {name:<22}  {elapsed:>6}  {fmt_bytes(bts):>5}  {mark}")
+        if status == "running" and "current" in d and d["current"]:
+            print(f"    ↳ {d['current']:<22}  {'…':>6}  {'':>5}  running")
+PY
+  exit 0
+fi
+
+# ------------------------------------------------------------------
+# Config sourcing — global, then per-repo.
+# ------------------------------------------------------------------
+[ -f "$GLOBAL_CONF" ] && . "$GLOBAL_CONF"
+
+# AI_PRELAUNCH is executed as `bash -c "$AI_PRELAUNCH"` before reviewers
+# fire — it MUST come from the user's global config (~/.config), never
+# from a repo-checked-in .ai-review/config that a collaborator could
+# plant. Snapshot the global value before sourcing the project config,
+# and restore it afterwards if project tried to override.
+_AI_PRELAUNCH_GLOBAL="${AI_PRELAUNCH:-}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+PROJECT_CONF="$REPO_ROOT/.ai-review/config"
+[ -n "$REPO_ROOT" ] && [ -f "$PROJECT_CONF" ] && . "$PROJECT_CONF"
+
+if [ "${AI_PRELAUNCH:-}" != "$_AI_PRELAUNCH_GLOBAL" ]; then
+  echo "ai-review: project .ai-review/config tried to set AI_PRELAUNCH — ignored." >&2
+  echo "  Reason: AI_PRELAUNCH runs as bash before reviewers; must come from" >&2
+  echo "  ~/.config/ai-review/config (under your home dir), not from inside the repo." >&2
+  AI_PRELAUNCH="$_AI_PRELAUNCH_GLOBAL"
+fi
+
+AI_CMD="${AI_CMD:-default}"
+AI_PROFILE_DIR="${AI_PROFILE_DIR:-$HOME/.claude}"
+AI_MODEL="${AI_MODEL:-}"
+AI_REVIEW_IDENTITY="${AI_REVIEW_IDENTITY:-auto}"
+AI_PRELAUNCH="${AI_PRELAUNCH:-}"
+
+preflight_missing() {
+  local need="$1" hint="$2"
+  if ! command -v "$need" >/dev/null 2>&1; then
+    echo "ai-review: required tool '$need' not on PATH." >&2
+    [ -n "$hint" ] && echo "  $hint" >&2
+    return 1
+  fi
+}
+preflight_missing claude "install Claude Code: https://docs.claude.com/en/docs/claude-code/" || exit 3
+preflight_missing gh     "install GitHub CLI: https://cli.github.com/" || exit 3
+preflight_missing jq     "install jq: https://stedolan.github.io/jq/" || exit 3
+preflight_missing python3 "Python 3 is required for the JWT minter and pipeline glue." || exit 3
+# AI_CMD is a logical preset label only (used in logs / state registry).
+# We always exec `claude`. CLAUDE_CONFIG_DIR is set to $AI_PROFILE_DIR so
+# multiple Claude profiles (e.g. personal vs work) can be addressed by name.
+
+# ------------------------------------------------------------------
+# Interactive setup (--init, or auto-prompted when missing).
+# ------------------------------------------------------------------
+ask() {
+  local prompt="$1" default="${2:-}" reply
+  if [ -n "$default" ]; then
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+  else
+    printf '%s: ' "$prompt" >&2
+  fi
+  IFS= read -r reply </dev/tty || reply=""
+  if [ -z "$reply" ]; then reply="$default"; fi
+  printf '%s' "$reply"
+}
+
+ask_yn() {
+  local prompt="$1" default="${2:-N}" reply
+  reply="$(ask "$prompt (y/N)" "$default")"
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+print_app_walkthrough() {
+  local owner="$1" repo="$2"
+  cat >&2 <<EOF
+
+GitHub App registration walkthrough for $owner/$repo:
+
+  1. Open: https://github.com/settings/apps/new
+  2. App name: anything globally unique (e.g. "${repo}-review-bot")
+  3. Homepage URL: https://github.com/$owner/$repo
+  4. Webhook: uncheck "Active"
+  5. Permissions:
+       Pull requests       → Read & write
+       Contents            → Read-only
+       Metadata            → Read-only
+  6. "Where can this GitHub App be installed?" → Only on this account
+  7. Create the App, then on its settings page:
+       - Note the App ID (top of page)
+       - Generate a private key, download the .pem
+  8. Install on this repo:
+       - Click "Install App" in left sidebar
+       - Choose "Only select repositories" → $owner/$repo
+       - After install, the URL will be:
+           https://github.com/settings/installations/<INSTALL_ID>
+         Note that INSTALL_ID.
+
+EOF
+}
+
+write_app_conf() {
+  local owner="$1" repo="$2" app_id="$3" install_id="$4" pem_src="$5"
+  local conf="$APPS_DIR/${owner}__${repo}.conf"
+  local pem="$APPS_DIR/${owner}__${repo}.pem"
+  mkdir -p "$APPS_DIR"
+  cp "$pem_src" "$pem"
+  chmod 600 "$pem"
+  cat > "$conf" <<EOF
+APP_ID=$app_id
+INSTALL_ID=$install_id
+PRIVATE_KEY=$pem
+EOF
+  echo "  wrote $conf" >&2
+  echo "  wrote $pem (chmod 600)" >&2
+}
+
+copy_reviewer_with_guidance() {
+  local src="$1" dst="$2" name; name="$(basename "$src" .sh | sed 's/^[0-9]*-//')"
+  {
+    head -1 "$src"  # shebang
+    cat <<EOF
+# ─────────────────────────────────────────────────────────────────────
+# CUSTOMIZED FOR THIS PROJECT (copied from ai-review global defaults).
+# ─────────────────────────────────────────────────────────────────────
+# Tailor this reviewer so reviews are sharper than generic ones:
+#
+# 1. applies()  — narrow the regex to file types this project uses.
+#                 The default may match too broadly (or not at all).
+# 2. focus area — reference YOUR project's specific docs, conventions,
+#                 known failure modes, severity bar. Generic prompts
+#                 produce generic reviews.
+# 3. tools      — \$STAGE1_TOOLS gives MCP research tools; if your
+#                 project doesn't use them, prune the allowlist.
+#
+# Diff the file against
+#   ~/.local/share/ai-review/reviewers.default/$(basename "$src")
+# to see what changed locally.
+# ─────────────────────────────────────────────────────────────────────
+EOF
+    tail -n +2 "$src"  # rest of original
+  } > "$dst"
+  chmod +x "$dst"
+}
+
+init_setup() {
+  if [ -z "$REPO_ROOT" ]; then
+    echo "ai-review --init: not inside a git repo." >&2
+    exit 3
+  fi
+  local owner repo
+  owner="$(gh repo view --json owner --jq .owner.login 2>/dev/null || echo "")"
+  repo="$(gh repo view --json name --jq .name 2>/dev/null || echo "")"
+  if [ -z "$owner" ] || [ -z "$repo" ]; then
+    echo "ai-review --init: gh repo view failed (need a GitHub remote)." >&2
+    exit 3
+  fi
+
+  echo "ai-review setup for $owner/$repo" >&2
+  echo "  global config:  $GLOBAL_CONF" >&2
+  echo "  project config: $REPO_ROOT/.ai-review/" >&2
+  echo "" >&2
+
+  # 1. Claude profile.
+  echo "(1/4) Claude profile" >&2
+  echo "  ai-review always invokes 'claude' — AI_PROFILE_DIR sets CLAUDE_CONFIG_DIR" >&2
+  echo "  for that invocation. Use this to keep multiple profiles (personal/work,"  >&2
+  echo "  Anthropic/Bedrock, account A/B) separate per project." >&2
+  echo "" >&2
+  echo "  [1] default — \$HOME/.claude (vanilla Claude Code config)" >&2
+  echo "  [2] custom  — point at another profile dir (e.g. ~/.claude-work)" >&2
+  local choice; choice="$(ask "choice" "1")"
+  local cmd profile model
+  case "$choice" in
+    2)
+      cmd="$(ask "label for this profile (used in logs)" "custom")"
+      profile="$(ask "profile dir (CLAUDE_CONFIG_DIR)" "$HOME/.claude-$cmd")"
+      profile="${profile/#\~/$HOME}"
+      model="$(ask "model id (blank = let Claude pick)" "")"
+      ;;
+    *)
+      cmd="default"; profile="$HOME/.claude"; model=""
+      ;;
+  esac
+
+  # Optional per-call timeout override.
+  echo "" >&2
+  echo "  Default per-reviewer timeout: 600s (10 min)." >&2
+  local timeout_override; timeout_override="$(ask "override AI_TIMEOUT? (blank = 600)" "")"
+
+  # 2. Identity.
+  echo "" >&2
+  echo "(2/4) Review identity" >&2
+  echo "  [1] auto    — App if configured, else gh-user (default)" >&2
+  echo "  [2] app     — require GitHub App (will set up now if missing)" >&2
+  echo "  [3] gh-user — post under your gh-cli login" >&2
+  choice="$(ask "choice" "1")"
+  local identity
+  case "$choice" in
+    2) identity=app ;;
+    3) identity=gh-user ;;
+    *) identity=auto ;;
+  esac
+
+  local app_conf="$APPS_DIR/${owner}__${repo}.conf"
+  if [ "$identity" != "gh-user" ]; then
+    if [ -f "$app_conf" ]; then
+      echo "  ✓ App config already at $app_conf — reusing." >&2
+    else
+      echo "" >&2
+      echo "  No App config found at $app_conf" >&2
+      echo "  [1] register a NEW GitHub App (walkthrough)" >&2
+      echo "  [2] reuse an existing <owner>__<repo>.conf from $APPS_DIR" >&2
+      echo "  [3] skip — fall back to gh-user when posting" >&2
+      choice="$(ask "choice" "3")"
+      case "$choice" in
+        1)
+          print_app_walkthrough "$owner" "$repo"
+          local app_id install_id pem
+          app_id="$(ask "App ID")"
+          install_id="$(ask "Installation ID")"
+          pem="$(ask "Path to .pem file")"
+          # expand ~ in pem path
+          pem="${pem/#\~/$HOME}"
+          if [ -n "$app_id" ] && [ -n "$install_id" ] && [ -f "$pem" ]; then
+            write_app_conf "$owner" "$repo" "$app_id" "$install_id" "$pem"
+          else
+            echo "  (incomplete — skipping App write; identity will fall back to gh-user)" >&2
+            [ "$identity" = "app" ] && identity=auto
+          fi
+          ;;
+        2)
+          local existing; existing="$(ask "path to existing .conf")"
+          existing="${existing/#\~/$HOME}"
+          if [ -f "$existing" ]; then
+            cp "$existing" "$app_conf"
+            local existing_pem; existing_pem="$(. "$existing" 2>/dev/null && echo "$PRIVATE_KEY")"
+            if [ -f "$existing_pem" ]; then
+              cp "$existing_pem" "$APPS_DIR/${owner}__${repo}.pem"
+              chmod 600 "$APPS_DIR/${owner}__${repo}.pem"
+              # rewrite PRIVATE_KEY path in the new conf
+              python3 -c "
+import sys
+p='$app_conf'
+s=open(p).read()
+import re
+s=re.sub(r'^PRIVATE_KEY=.*\$', 'PRIVATE_KEY=$APPS_DIR/${owner}__${repo}.pem', s, flags=re.M)
+open(p,'w').write(s)
+"
+              echo "  copied $existing → $app_conf" >&2
+            fi
+          else
+            echo "  (file not found — skipping)" >&2
+            [ "$identity" = "app" ] && identity=auto
+          fi
+          ;;
+        *)
+          [ "$identity" = "app" ] && identity=auto
+          ;;
+      esac
+    fi
+  fi
+
+  # 3. Reviewers.
+  echo "" >&2
+  echo "(3/4) Reviewers" >&2
+  echo "  Global defaults:" >&2
+  for f in "$SHARE/reviewers.default"/*.sh; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f" .sh | sed 's/^[0-9]*-//')"
+    desc="$(grep -m1 -E '^# Reviewer:' "$f" | sed 's/^# Reviewer: //')"
+    printf "    %-16s %s\n" "$n" "${desc:-(no description)}" >&2
+  done
+  local proj_rev="$REPO_ROOT/.ai-review/reviewers"
+  mkdir -p "$proj_rev"
+  if ask_yn "Copy all to $proj_rev/ for tweaking?" "Y"; then
+    for f in "$SHARE/reviewers.default"/*.sh; do
+      [ -f "$f" ] || continue
+      local b; b="$(basename "$f")"
+      if [ -f "$proj_rev/$b" ]; then
+        echo "  ($b already exists, skipping)" >&2
+      else
+        copy_reviewer_with_guidance "$f" "$proj_rev/$b"
+        echo "  copied $b" >&2
+      fi
+    done
+  else
+    echo "  ok — globals will run as-is for this project" >&2
+  fi
+
+  # 4. Hook hint.
+  echo "" >&2
+  echo "(4/4) Pre-push hook (lefthook)" >&2
+  echo "  Add this stanza to your lefthook-local.yml (or lefthook.yml) to fire" >&2
+  echo "  ai-review on \`AI_REVIEW=1 git push\`:" >&2
+  cat >&2 <<'YAML'
+
+  pre-push:
+    commands:
+      ai-review:
+        run: |
+          if [ "${AI_REVIEW:-}" = "1" ]; then
+            mkdir -p "$HOME/.cache"
+            ( sleep 8 && ai-review </dev/null >>"$HOME/.cache/ai-review.log" 2>&1 ) &
+            disown 2>/dev/null || true
+            echo "▸ ai-review running in background"
+          else
+            echo "▸ skipping ai-review (set AI_REVIEW=1 to enable)"
+          fi
+YAML
+
+  # Write project config.
+  local proj_conf="$REPO_ROOT/.ai-review/config"
+  {
+    echo "# ai-review project overrides for $owner/$repo"
+    echo "# Sourced as bash; only set what differs from ~/.config/ai-review/config."
+    # Plain assignment so project values OVERRIDE the global config.
+    # For one-off env-var override, run: AI_FOO=x ai-review
+    [ -n "$cmd" ] && echo "AI_CMD=$cmd"
+    [ -n "$profile" ] && echo "AI_PROFILE_DIR=$profile"
+    [ -n "$model" ] && echo "AI_MODEL=$model"
+    [ -n "$timeout_override" ] && echo "AI_TIMEOUT=$timeout_override"
+    echo "AI_REVIEW_IDENTITY=$identity"
+  } > "$proj_conf"
+  echo "" >&2
+  echo "Wrote $proj_conf" >&2
+  echo "Done. Try: ai-review --list" >&2
+}
+
+if $INIT; then
+  init_setup
+  exit 0
+fi
+
+# First run in a repo with no .ai-review/ — go straight into init.
+# Non-interactive shells (no tty) fall through silently with globals so
+# CI / hooks / cron don't block on a prompt.
+REPO_AI_DIR="$REPO_ROOT/.ai-review"
+if [ -n "$REPO_ROOT" ] && [ ! -e "$REPO_AI_DIR" ] && ! $LIST; then
+  if [ -t 0 ]; then
+    echo "ai-review: first run in this repo — entering setup." >&2
+    echo "  (skip with: mkdir -p $REPO_AI_DIR  ─ any contents stop the auto-prompt)" >&2
+    echo "" >&2
+    init_setup
+    echo "" >&2
+    echo "Setup complete. Run 'ai-review' again to review the current PR." >&2
+    exit 0
+  else
+    # Non-tty: silent fallthrough to globals.
+    :
+  fi
+fi
+
+# ------------------------------------------------------------------
+# Resolve PR + identity.
+# ------------------------------------------------------------------
+# Audit mode skips PR resolution entirely — the audit is whole-repo,
+# anchored to HEAD of the working tree, no diff involved.
+if $AUDIT; then
+  PR_JSON=""
+  PR_NUM=0
+  BASE_REF=""
+  HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
+  BASE_SHA=""
+else
+  PR_JSON="$(gh pr view --json number,title,body,baseRefName,headRefOid 2>/dev/null || true)"
+  if [ -z "$PR_JSON" ] && ! $LIST; then
+    echo "no open PR for current branch — push first (or use --audit for whole-repo)" >&2
+    exit 1
+  fi
+  if [ -n "$PR_JSON" ]; then
+    PR_NUM=$(jq -r '.number' <<<"$PR_JSON")
+    BASE_REF=$(jq -r '.baseRefName' <<<"$PR_JSON")
+    HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
+  else
+    PR_NUM=0; BASE_REF="main"; HEAD_SHA=""; BASE_SHA=""
+  fi
+fi
+REPO_OWNER=$(gh repo view --json owner --jq .owner.login)
+REPO_NAME=$(gh repo view --json name --jq .name)
+REPO_URL="https://github.com/$REPO_OWNER/$REPO_NAME"
+
+# Per-repo App config lookup.
+APP_CONF="$APPS_DIR/${REPO_OWNER}__${REPO_NAME}.conf"
+APP_TOKEN=""
+
+resolve_identity() {
+  case "$AI_REVIEW_IDENTITY" in
+    app)
+      if [ ! -f "$APP_CONF" ]; then
+        echo "ai-review: AI_REVIEW_IDENTITY=app but no App config at:" >&2
+        echo "  $APP_CONF" >&2
+        echo "  drop a .conf (APP_ID, INSTALL_ID, PRIVATE_KEY) and matching .pem there," >&2
+        echo "  or run with AI_REVIEW_IDENTITY=gh-user for one-off." >&2
+        exit 3
+      fi
+      ;;
+    gh-user)
+      APP_CONF=""
+      ;;
+    auto)
+      if [ ! -f "$APP_CONF" ]; then APP_CONF=""; fi
+      ;;
+    *)
+      echo "ai-review: unknown AI_REVIEW_IDENTITY='$AI_REVIEW_IDENTITY' (use app|gh-user|auto)" >&2
+      exit 3
+      ;;
+  esac
+}
+resolve_identity
+
+# Mint App installation token if applicable.
+if [ -n "$APP_CONF" ]; then
+  if ! python3 -c 'import cryptography' >/dev/null 2>&1; then
+    echo "ai-review: App auth requires the Python 'cryptography' package." >&2
+    echo "  install with: python3 -m pip install --user cryptography" >&2
+    echo "  (or run with AI_REVIEW_IDENTITY=gh-user to skip App auth)" >&2
+    exit 3
+  fi
+  # shellcheck disable=SC1090
+  . "$APP_CONF"
+  APP_AUTH=$(python3 - "$APP_ID" "$INSTALL_ID" "$PRIVATE_KEY" <<'PY'
+import base64, json, sys, time, urllib.request
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+app_id, install_id, key_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(key_path, "rb") as f:
+    key = serialization.load_pem_private_key(f.read(), password=None)
+
+def b64(d):
+    if isinstance(d, dict):
+        d = json.dumps(d, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+
+now = int(time.time())
+header = b64({"alg": "RS256", "typ": "JWT"})
+payload = b64({"iat": now - 30, "exp": now + 540, "iss": app_id})
+inp = f"{header}.{payload}".encode()
+sig = key.sign(inp, padding.PKCS1v15(), hashes.SHA256())
+jwt = f"{header}.{payload}.{b64(sig)}"
+
+# Fetch app slug with the JWT (installation token can't hit /app).
+slug = ""
+try:
+    req = urllib.request.Request(
+        "https://api.github.com/app",
+        headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req) as r:
+        slug = json.load(r).get("slug", "")
+except Exception:
+    pass
+
+# Mint installation access token.
+req = urllib.request.Request(
+    f"https://api.github.com/app/installations/{install_id}/access_tokens",
+    method="POST",
+    headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json"},
+)
+with urllib.request.urlopen(req) as r:
+    token = json.load(r)["token"]
+print(f"{token}|{slug}")
+PY
+)
+  APP_TOKEN="${APP_AUTH%|*}"
+  APP_SLUG="${APP_AUTH##*|}"
+fi
+export APP_TOKEN
+
+if [ -n "$APP_TOKEN" ]; then
+  IDENTITY="${APP_SLUG:-ai-review}[bot]"
+else
+  IDENTITY="$(gh api user --jq .login 2>/dev/null || echo 'gh-user')"
+fi
+
+if ! $LIST; then
+  if $AUDIT; then
+    echo "▸ audit (HEAD ${HEAD_SHA:0:7}) — writing local report (cmd: $AI_CMD)" >&2
+  else
+    echo "▸ PR #$PR_NUM ($BASE_REF → ${HEAD_SHA:0:7}) — posting as $IDENTITY (cmd: $AI_CMD)" >&2
+  fi
+
+  # Optional pre-launch hook — useful when AI_CMD relies on a local
+  # adapter / proxy / tmux session that needs to be running. Set
+  # AI_PRELAUNCH in your config to any shell command. See
+  # examples/config.example for sample patterns.
+  if [ -n "$AI_PRELAUNCH" ]; then
+    echo "▸ running AI_PRELAUNCH hook..." >&2
+    bash -c "$AI_PRELAUNCH" || {
+      echo "AI_PRELAUNCH failed — aborting" >&2
+      exit 3
+    }
+  fi
+fi
+
+# ------------------------------------------------------------------
+# Run dir + diff + PR meta.
+# ------------------------------------------------------------------
+RUN_ID="pr${PR_NUM}-$(date +%s)"
+RUN_DIR="/tmp/ai-review/$RUN_ID"
+mkdir -p "$RUN_DIR/stage1"
+
+# Global run registry — one file per run, updated on exit.
+STATE_FILE="$STATE_DIR/${REPO_OWNER}__${REPO_NAME}__${RUN_ID}.run"
+{
+  echo "owner=$REPO_OWNER"
+  echo "repo=$REPO_NAME"
+  echo "pr=$PR_NUM"
+  echo "started=$(date +%s)"
+  echo "run_dir=$RUN_DIR"
+  echo "identity=$IDENTITY"
+  echo "ai_cmd=$AI_CMD"
+  echo "pid=$$"
+  echo "status=running"
+  $AUDIT && echo "kind=audit"
+} > "$STATE_FILE"
+
+mark_done() {
+  local rc="$?"
+  if [ -f "$STATE_FILE" ]; then
+    {
+      grep -v -E '^(status|ended|exit_code)=' "$STATE_FILE"
+      echo "ended=$(date +%s)"
+      echo "exit_code=$rc"
+      if [ "$rc" -eq 0 ]; then echo "status=done"; else echo "status=failed"; fi
+    } > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  fi
+  if ! $KEEP && ! $LIST; then rm -rf "$RUN_DIR"; fi
+}
+trap mark_done EXIT
+
+if ! $LIST; then
+  echo "▸ run artifacts: $RUN_DIR" >&2
+fi
+
+if [ -n "$PR_JSON" ]; then
+  git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+  # merge-base, NOT origin/$BASE_REF tip — handles PRs behind main correctly.
+  BASE_SHA="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
+  git diff "$BASE_SHA..$HEAD_SHA" > "$RUN_DIR/pr.diff"
+  if [ "$(wc -c < "$RUN_DIR/pr.diff")" -gt 600000 ]; then
+    head -c 600000 "$RUN_DIR/pr.diff" > "$RUN_DIR/pr.diff.trunc"
+    printf '\n[diff truncated to 600K bytes]\n' >> "$RUN_DIR/pr.diff.trunc"
+    mv "$RUN_DIR/pr.diff.trunc" "$RUN_DIR/pr.diff"
+  fi
+  gh pr view "$PR_NUM" --json title,body \
+    --jq '"# " + .title + "\n\n" + (.body // "(no description)")' \
+    > "$RUN_DIR/pr-meta.md"
+fi
+
+# Export everything reviewer scripts need.
+export AI_REVIEW_LIB="$LIB"
+export AI_CMD AI_PROFILE_DIR AI_MODEL
+export STATE_FILE
+export RUN_DIR REPO_ROOT REPO_OWNER REPO_NAME REPO_URL
+export PR_NUM BASE_REF BASE_SHA HEAD_SHA MODEL="$AI_MODEL"
+# Mode flag for stage-1 reviewers and lib helpers that branch on PR vs audit.
+if $AUDIT; then
+  export AI_REVIEW_MODE=audit
+else
+  export AI_REVIEW_MODE=pr
+fi
+
+# ------------------------------------------------------------------
+# Reviewer discovery: project overrides global by basename.
+# ------------------------------------------------------------------
+PROJECT_REVIEWERS="$REPO_ROOT/.ai-review/reviewers"
+GLOBAL_REVIEWERS="$SHARE/reviewers.default"
+
+# bash 3.2 — no associative arrays. Use parallel name|path lines, sorted.
+ENTRIES=""
+seen_base() {
+  printf '%s\n' "$ENTRIES" | awk -F'|' -v b="$1" '$1==b{found=1} END{exit !found}'
+}
+add_dir() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  for s in "$dir"/*.sh; do
+    [ -f "$s" ] || continue
+    local b; b="$(basename "$s")"
+    if ! seen_base "$b"; then
+      ENTRIES="${ENTRIES}${b}|${s}
+"
+    fi
+  done
+}
+
+# Project FIRST so it wins on basename collision.
+add_dir "$PROJECT_REVIEWERS"
+add_dir "$GLOBAL_REVIEWERS"
+
+if [ -z "$ENTRIES" ]; then
+  echo "ai-review: no reviewers found." >&2
+  echo "  global defaults: $GLOBAL_REVIEWERS" >&2
+  echo "  project:         $PROJECT_REVIEWERS" >&2
+  echo "  copy a few global reviewers into the project to start, e.g.:" >&2
+  echo "    mkdir -p $PROJECT_REVIEWERS && cp $GLOBAL_REVIEWERS/*.sh $PROJECT_REVIEWERS/" >&2
+  exit 0
+fi
+
+SORTED_ENTRIES="$(printf '%s' "$ENTRIES" | sort)"
+
+in_csv() {
+  local needle="$1" csv="$2"
+  [ -z "$csv" ] && return 1
+  for x in ${csv//,/ }; do [ "$x" = "$needle" ] && return 0; done
+  return 1
+}
+
+TO_RUN=()
+SKIPPED=()
+
+while IFS='|' read -r b script; do
+  [ -z "$b" ] && continue
+  name="$(basename "$b" .sh | sed 's/^[0-9]*-//')"
+
+  if [ -n "$ONLY" ]; then
+    if in_csv "$name" "$ONLY"; then TO_RUN+=("$script:$name")
+    else SKIPPED+=("$name (--only filter)"); fi
+    continue
+  fi
+
+  if in_csv "$name" "$EXCLUDE"; then
+    SKIPPED+=("$name (--exclude)")
+    continue
+  fi
+
+  if in_csv "$name" "$INCLUDE"; then
+    TO_RUN+=("$script:$name")
+    continue
+  fi
+
+  # Audit mode: applies() relies on diff_touches which has no diff to look
+  # at — run every discovered reviewer instead. PR mode: honor applies().
+  if $AUDIT; then
+    TO_RUN+=("$script:$name")
+  elif [ -n "$PR_JSON" ] && bash "$script" applies 2>/dev/null; then
+    TO_RUN+=("$script:$name")
+  else
+    SKIPPED+=("$name (applies()=false)")
+  fi
+done <<EOF
+$SORTED_ENTRIES
+EOF
+
+if $LIST; then
+  echo "discovered reviewers:"
+  echo "  project: $PROJECT_REVIEWERS"
+  echo "  global:  $GLOBAL_REVIEWERS"
+  echo
+  for entry in "${TO_RUN[@]:-}"; do
+    [ -z "$entry" ] && continue
+    name="${entry##*:}"
+    src="${entry%%:*}"
+    origin="global"
+    case "$src" in "$PROJECT_REVIEWERS"/*) origin="project" ;; esac
+    printf "  %-18s  would run   [%s]\n" "$name" "$origin"
+  done
+  for line in "${SKIPPED[@]:-}"; do
+    [ -z "$line" ] && continue
+    printf "  %-18s  SKIP %s\n" "${line%% *}" "${line#* }"
+  done
+  exit 0
+fi
+
+if [ "${#TO_RUN[@]}" -eq 0 ]; then
+  echo "▸ no reviewers apply; nothing to do." >&2
+  exit 0
+fi
+
+# ------------------------------------------------------------------
+# Stage 1.
+# ------------------------------------------------------------------
+echo "▸ stage 1: running ${#TO_RUN[@]} reviewer(s)" >&2
+for entry in "${TO_RUN[@]}"; do
+  script="${entry%%:*}"
+  bash "$script" run || true
+done
+echo "▸ stage 1 complete" >&2
+
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "  • skipped: ${SKIPPED[*]}" >&2
+fi
+
+# ------------------------------------------------------------------
+# Quick mode.
+# ------------------------------------------------------------------
+if $QUICK; then
+  {
+    for entry in "${TO_RUN[@]}"; do
+      name="${entry##*:}"
+      f="$RUN_DIR/stage1/$name.md"
+      [ ! -s "$f" ] && continue
+      [ "$(cat "$f")" = "NONE" ] && continue
+      printf '## %s\n\n%s\n\n' "$name" "$(cat "$f")"
+    done
+  } > "$RUN_DIR/summary.md"
+
+  # Pass paths via argv — body comes from an LLM and may contain quotes,
+  # backslashes, or anything else that would break shell-string interpolation.
+  PAYLOAD=$(python3 - "$HEAD_SHA" "$RUN_DIR/summary.md" <<'PY'
+import json, sys
+sha, summary_path = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "commit_id": sha,
+    "event": "COMMENT",
+    "body": open(summary_path).read(),
+}))
+PY
+)
+  if [ -n "$APP_TOKEN" ]; then
+    curl -sS -X POST \
+      -H "Authorization: Bearer $APP_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      -H "Content-Type: application/json" \
+      --data-binary "$PAYLOAD" \
+      "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" \
+      >/dev/null
+  else
+    echo "$PAYLOAD" > "$RUN_DIR/payload.json"
+    gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" \
+      --input "$RUN_DIR/payload.json" >/dev/null
+  fi
+  echo "▸ posted quick review" >&2
+elif $AUDIT; then
+  # Audit mode: skip stages 2/3/4 (no diff, no GitHub post) — concat
+  # stage-1 outputs into <repo>/.ai-review/audits/YYYY-MM-DD-HHMM.md.
+  bash "$SHARE/helpers/write-audit-report.sh"
+else
+  # Past-reviews fetch runs AFTER stage 1 so reviewers form findings
+  # without bias from prior runs, but BEFORE stage 2 so dedupe + cross-
+  # reference can use them.
+  echo "▸ fetching prior reviews on PR #$PR_NUM..." >&2
+  bash "$SHARE/helpers/fetch-past-reviews.sh"
+  bash "$SHARE/pipeline/extract-line-findings.sh"
+  bash "$SHARE/pipeline/consolidate-summary.sh"
+  bash "$SHARE/pipeline/post-review.sh"
+fi
+
+# ------------------------------------------------------------------
+# Transcript index.
+# ------------------------------------------------------------------
+echo "" >&2
+echo "▸ transcripts:" >&2
+for tfile in "$RUN_DIR/stage1"/*.transcript "$RUN_DIR"/stage2.transcript "$RUN_DIR"/stage3.transcript; do
+  [ ! -f "$tfile" ] && continue
+  name="$(basename "$tfile" .transcript)"
+  path="$(cat "$tfile")"
+  if [ -n "$path" ]; then
+    printf "    %-22s  %s\n" "$name" "$path" >&2
+  else
+    printf "    %-22s  (no transcript captured)\n" "$name" >&2
+  fi
+done
+echo "" >&2
+echo "▸ run artifacts: $RUN_DIR" >&2
+echo "▸ done." >&2

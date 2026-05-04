@@ -1,0 +1,52 @@
+# ai-review global config — sourced as bash by ~/.local/bin/ai-review.
+# Per-repo settings live in <repo>/.ai-review/config and override these.
+
+# ----- Claude profile ------------------------------------------------
+# Which Claude Code profile dir to use. ai-review always invokes `claude`;
+# this just sets CLAUDE_CONFIG_DIR for the invocation, so you can keep
+# multiple profiles (personal/work, Anthropic/Bedrock, account A/B)
+# separate per project.
+AI_PROFILE_DIR="${AI_PROFILE_DIR:-$HOME/.claude}"
+
+# Logical label for the profile — appears in logs and the run registry.
+# Free-form. Use whatever helps you tell profiles apart at a glance:
+# "personal" / "work" / "bedrock" / "default" / etc.
+AI_CMD="${AI_CMD:-default}"
+
+# Optional model override. Blank = let Claude pick its default. Set this
+# only when you want a specific model id (commonly when AI_PROFILE_DIR
+# points at an adapter that maps Claude → a different backend).
+# AI_MODEL="claude-sonnet-4-6"
+
+# ----- Pre-launch hook -----------------------------------------------
+# Optional shell command run before the first reviewer fires. Useful when
+# AI_CMD relies on a local adapter / proxy / tmux session.
+#
+# SECURITY: AI_PRELAUNCH is honored ONLY from this global config (or from
+# the inline shell env). A per-repo .ai-review/config that tries to set
+# AI_PRELAUNCH is ignored with a warning — otherwise a collaborator with
+# merge access to one of your repos could plant arbitrary shell that
+# fires every time you run ai-review there.
+#
+# Examples (illustrative — replace placeholders with your own values):
+#   AI_PRELAUNCH='lsof -i :<PORT> -t >/dev/null || tmux new-session -d -s adapter "node ~/adapter/server.js"'
+#   AI_PRELAUNCH='aws sso login --profile work'
+# AI_PRELAUNCH=""
+
+# ----- Per-call timeout ----------------------------------------------
+# Default seconds-per-reviewer-call. Each reviewer can override by
+# passing an explicit value to call_claude. Bump this if you're using
+# a slow remote / a large model that thinks for a long time.
+AI_TIMEOUT="${AI_TIMEOUT:-600}"
+
+# ----- Review banner -------------------------------------------------
+# Markdown prepended to the review body. Set to empty string to disable.
+# AI_REVIEW_BANNER='> **Automated review** from the `ai-review` pipeline.
+# > Findings are LLM-generated — apply judgment before acting on them.'
+
+# ----- Identity for posting the review -------------------------------
+# - "auto"    → use a GitHub App if ~/.config/ai-review/apps/<owner>__<repo>.conf
+#               exists, otherwise fall back to your gh-cli login
+# - "app"     → require a GitHub App (errors out if missing)
+# - "gh-user" → always post under your gh-cli login
+AI_REVIEW_IDENTITY="${AI_REVIEW_IDENTITY:-auto}"

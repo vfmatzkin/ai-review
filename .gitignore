@@ -1,0 +1,8 @@
+# Local working files
+*.log
+*.swp
+.DS_Store
+
+# Audit reports written by `ai-review --audit` are private working notes,
+# not source. Comment this line out to commit them.
+.ai-review/audits/
