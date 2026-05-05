@@ -112,7 +112,8 @@ Why multi-stage rather than one shot:
 | `ai-review --audit` | Whole-repo audit → markdown report at `<repo>/.ai-review/audits/`. |
 | `ai-review --init` | Re-enter the wizard. |
 | `ai-review --list` | Show discovered reviewers (project + global). |
-| `ai-review --status` | Run table — last 3 per repo, with per-task timings. |
+| `ai-review --status` | Run table — running runs + anything from the last 30 minutes. |
+| `ai-review --status latest` | Most recent run per repo. |
 | `ai-review --status N` | Last N runs per repo. |
 | `ai-review --status all` | Every recorded run. |
 | `ai-review --include foo,bar` | Force-include reviewers `foo` and `bar`. |

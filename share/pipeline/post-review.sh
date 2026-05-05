@@ -48,18 +48,23 @@ print(json.dumps({
 }))
 PY
 
-INLINE_COUNT=$(python3 -c "import json; print(len(json.load(open('$REVIEW_PAYLOAD'))['comments']))")
+INLINE_COUNT=$(python3 - "$REVIEW_PAYLOAD" <<'PY'
+import json, sys
+print(len(json.load(open(sys.argv[1]))['comments']))
+PY
+)
 echo "  • $INLINE_COUNT inline finding(s) validated against diff" >&2
 
 # Skip the post if there's nothing new since a prior bot review.
 # The run still appears in --status; the user gets the receipt + the
 # prior URL via the registry.
 if [ "$INLINE_COUNT" -eq 0 ] && [ -f "$RUN_DIR/past-reviews.json" ]; then
-  PRIOR_URL=$(python3 -c "
+  PRIOR_URL=$(python3 - "$RUN_DIR/past-reviews.json" <<'PY' 2>/dev/null
 import json, sys
-rs = json.load(open('$RUN_DIR/past-reviews.json')).get('reviews', [])
+rs = json.load(open(sys.argv[1])).get('reviews', [])
 print(rs[0]['url'] if rs else '')
-" 2>/dev/null)
+PY
+)
   if [ -n "$PRIOR_URL" ]; then
     echo "▸ no new findings since prior review: $PRIOR_URL — skipping post" >&2
     update_run_field skipped_reason "no new findings since $PRIOR_URL"

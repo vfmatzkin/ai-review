@@ -23,10 +23,10 @@ if ! gh_api "repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" > "$TMP/reviews
 fi
 
 # 2. Pick bot review IDs (most-recent first, max 5).
-BOT_REVIEW_IDS=$(python3 -c "
-import json
+BOT_REVIEW_IDS=$(python3 - "$TMP/reviews.json" <<'PY'
+import json, sys
 try:
-    rs = json.load(open('$TMP/reviews.json'))
+    rs = json.load(open(sys.argv[1]))
     if not isinstance(rs, list): rs = []
 except Exception:
     rs = []
@@ -34,7 +34,8 @@ bots = [r for r in rs if (r.get('user') or {}).get('type') == 'Bot' and (r.get('
 bots.sort(key=lambda x: x.get('submitted_at',''), reverse=True)
 for r in bots[:5]:
     print(r['id'])
-")
+PY
+)
 
 # 3. For each bot review, fetch its inline comments.
 for rid in $BOT_REVIEW_IDS; do
