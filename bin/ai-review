@@ -27,7 +27,8 @@
 #   ai-review --exclude runtime-test # skip these
 #   ai-review --only correctness     # ONLY this one
 #   ai-review --list                 # show discovered reviewers
-#   ai-review --status               # last 3 runs per repo (default)
+#   ai-review --status               # running + runs from the last 30 min
+#   ai-review --status latest        # most recent run per repo
 #   ai-review --status 10            # last 10 runs per repo
 #   ai-review --status all           # every recorded run
 #   ai-review --quick                # skip stages 2/3, single summary
@@ -57,7 +58,7 @@ QUICK=false
 KEEP=false
 INIT=false
 STATUS=false
-STATUS_LIMIT=3
+STATUS_LIMIT=recent
 AUDIT=false
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,7 +74,7 @@ while [ $# -gt 0 ]; do
       STATUS=true; shift
       if [ $# -gt 0 ]; then
         case "$1" in
-          all|[0-9]*) STATUS_LIMIT="$1"; shift ;;
+          all|latest|[0-9]*) STATUS_LIMIT="$1"; shift ;;
         esac
       fi
       ;;
@@ -101,7 +102,23 @@ from collections import defaultdict
 
 state_dir = sys.argv[1]
 limit_arg = sys.argv[2]
-limit = None if limit_arg == "all" else int(limit_arg)
+# Modes:
+#   "all"    → no filter
+#   "recent" → running + started within the last RECENT_WINDOW seconds
+#   <int>    → last N runs per repo
+RECENT_WINDOW = 30 * 60
+if limit_arg == "all":
+    limit = None
+    recent_only = False
+elif limit_arg == "recent":
+    limit = None
+    recent_only = True
+elif limit_arg == "latest":
+    limit = 1
+    recent_only = False
+else:
+    limit = int(limit_arg)
+    recent_only = False
 
 files = sorted(glob.glob(os.path.join(state_dir, "*.run")), key=os.path.getmtime, reverse=True)
 if not files:
@@ -163,14 +180,36 @@ sorted_groups = sorted(by_repo.items(), key=lambda kv: group_recency(kv[1]), rev
 
 now = int(time.time())
 HEADER = f"{'REPO':<26}  {'PR':>5}  {'STATUS':<10}  {'STARTED':<16}  {'TOTAL':>6}  LINK"
-print(HEADER)
-print("-" * len(HEADER))
 
-first_group = True
+# Pre-filter so we can show an empty-state message instead of a bare header.
+filtered_groups = []
 for (owner, repo), entries in sorted_groups:
     entries.sort(key=lambda fd: int(fd[1].get("started","0") or 0), reverse=True)
     if limit is not None:
         entries = entries[:limit]
+    if recent_only:
+        cutoff = now - RECENT_WINDOW
+        def keep(fd):
+            d = fd[1]
+            started = int(d.get("started", "0") or 0)
+            is_running = d.get("status") == "running" and d.get("pid") and alive(d["pid"])
+            return is_running or started >= cutoff
+        entries = [fd for fd in entries if keep(fd)]
+    if entries:
+        filtered_groups.append(((owner, repo), entries))
+
+if not filtered_groups:
+    if recent_only:
+        print("(no running runs and none in the last 30 min — try --status all)")
+    else:
+        print("(no runs recorded)")
+    sys.exit(0)
+
+print(HEADER)
+print("-" * len(HEADER))
+
+first_group = True
+for (owner, repo), entries in filtered_groups:
     if not first_group:
         print()  # blank line between repo groups
     first_group = False
