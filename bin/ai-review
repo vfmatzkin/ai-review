@@ -480,15 +480,19 @@ init_setup() {
             if [ -f "$existing_pem" ]; then
               cp "$existing_pem" "$APPS_DIR/${owner}__${repo}.pem"
               chmod 600 "$APPS_DIR/${owner}__${repo}.pem"
-              # rewrite PRIVATE_KEY path in the new conf
-              python3 -c "
-import sys
-p='$app_conf'
-s=open(p).read()
-import re
-s=re.sub(r'^PRIVATE_KEY=.*\$', 'PRIVATE_KEY=$APPS_DIR/${owner}__${repo}.pem', s, flags=re.M)
-open(p,'w').write(s)
-"
+              # rewrite PRIVATE_KEY path in the new conf. Pass paths via
+              # argv and let Python escape the replacement — backslashes
+              # in the path (e.g. WSL paths) would otherwise be parsed as
+              # regex group refs and silently corrupt the line.
+              python3 - "$app_conf" "$APPS_DIR/${owner}__${repo}.pem" <<'PY'
+import re, sys
+conf_path, pem_path = sys.argv[1], sys.argv[2]
+s = open(conf_path).read()
+s = re.sub(r'^PRIVATE_KEY=.*$',
+           'PRIVATE_KEY=' + pem_path.replace('\\', r'\\'),
+           s, flags=re.M)
+open(conf_path, 'w').write(s)
+PY
               echo "  copied $existing → $app_conf" >&2
             fi
           else
@@ -762,7 +766,10 @@ mark_done() {
   local rc="$?"
   if [ -f "$STATE_FILE" ]; then
     {
-      grep -v -E '^(status|ended|exit_code)=' "$STATE_FILE"
+      # `|| :` because grep -v exits 1 when nothing matches (e.g. early
+      # failure before status= was written), which would abort the
+      # subshell under set -e and leave the state file empty.
+      grep -v -E '^(status|ended|exit_code)=' "$STATE_FILE" || :
       echo "ended=$(date +%s)"
       echo "exit_code=$rc"
       if [ "$rc" -eq 0 ]; then echo "status=done"; else echo "status=failed"; fi
@@ -925,6 +932,32 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   echo "  • skipped: ${SKIPPED[*]}" >&2
 fi
 
+# Cancellation guard: if any reviewer was killed by a signal (SIGINT,
+# SIGTERM, SIGKILL, or `timeout`), call_claude touches .cancelled. Don't
+# post a partial review built from interrupted stage-1 outputs.
+if [ -e "$RUN_DIR/.cancelled" ]; then
+  echo "▸ reviewer cancelled — skipping stages 2-4, no review will be posted" >&2
+  exit 130
+fi
+
+# No-content guard: if every reviewer output is empty or "NONE", there's
+# nothing to post. Stages 2-4 would still run and emit an empty body.
+if ! $AUDIT; then
+  has_content=false
+  for entry in "${TO_RUN[@]}"; do
+    name="${entry##*:}"
+    f="$RUN_DIR/stage1/$name.md"
+    [ -s "$f" ] || continue
+    [ "$(cat "$f")" = "NONE" ] && continue
+    has_content=true
+    break
+  done
+  if ! $has_content; then
+    echo "▸ no reviewer produced findings — nothing to post" >&2
+    exit 0
+  fi
+fi
+
 # ------------------------------------------------------------------
 # Quick mode.
 # ------------------------------------------------------------------
@@ -951,18 +984,26 @@ print(json.dumps({
 }))
 PY
 )
+  echo "$PAYLOAD" > "$RUN_DIR/payload.json"
   if [ -n "$APP_TOKEN" ]; then
-    curl -sS -X POST \
+    HTTP_CODE=$(curl -sS -o "$RUN_DIR/payload.resp" -w '%{http_code}' \
+      -X POST \
       -H "Authorization: Bearer $APP_TOKEN" \
       -H "Accept: application/vnd.github+json" \
       -H "Content-Type: application/json" \
-      --data-binary "$PAYLOAD" \
-      "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" \
-      >/dev/null
+      --data-binary @"$RUN_DIR/payload.json" \
+      "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews")
+    if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+      echo "▸ quick post failed (HTTP $HTTP_CODE); response head:" >&2
+      head -10 "$RUN_DIR/payload.resp" >&2
+      exit 1
+    fi
   else
-    echo "$PAYLOAD" > "$RUN_DIR/payload.json"
-    gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" \
-      --input "$RUN_DIR/payload.json" >/dev/null
+    if ! gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" \
+        --input "$RUN_DIR/payload.json" >/dev/null; then
+      echo "▸ quick post failed (gh api)" >&2
+      exit 1
+    fi
   fi
   echo "▸ posted quick review" >&2
 elif $AUDIT; then
