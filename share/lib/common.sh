@@ -94,6 +94,13 @@ call_claude() {
   else
     exit_code=$?
     printf '\n_(reviewer exited non-zero — output may be partial)_\n' >> "$out"
+    # Signal-induced exits (timeout=124, SIGINT=130, SIGKILL=137, SIGTERM=143)
+    # mean the user (or `timeout`) cancelled this reviewer. Flag the run
+    # so the orchestrator skips stages 2-4 and does NOT post a partial
+    # review. Natural reviewer failures are still passed through.
+    case "$exit_code" in
+      124|130|137|143) : > "$RUN_DIR/.cancelled" ;;
+    esac
   fi
   local end; end=$(date +%s)
   local elapsed=$(( end - start ))

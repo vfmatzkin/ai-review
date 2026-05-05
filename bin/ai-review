@@ -932,6 +932,32 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   echo "  • skipped: ${SKIPPED[*]}" >&2
 fi
 
+# Cancellation guard: if any reviewer was killed by a signal (SIGINT,
+# SIGTERM, SIGKILL, or `timeout`), call_claude touches .cancelled. Don't
+# post a partial review built from interrupted stage-1 outputs.
+if [ -e "$RUN_DIR/.cancelled" ]; then
+  echo "▸ reviewer cancelled — skipping stages 2-4, no review will be posted" >&2
+  exit 130
+fi
+
+# No-content guard: if every reviewer output is empty or "NONE", there's
+# nothing to post. Stages 2-4 would still run and emit an empty body.
+if ! $AUDIT; then
+  has_content=false
+  for entry in "${TO_RUN[@]}"; do
+    name="${entry##*:}"
+    f="$RUN_DIR/stage1/$name.md"
+    [ -s "$f" ] || continue
+    [ "$(cat "$f")" = "NONE" ] && continue
+    has_content=true
+    break
+  done
+  if ! $has_content; then
+    echo "▸ no reviewer produced findings — nothing to post" >&2
+    exit 0
+  fi
+fi
+
 # ------------------------------------------------------------------
 # Quick mode.
 # ------------------------------------------------------------------
