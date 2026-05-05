@@ -59,7 +59,11 @@ echo "  • $INLINE_COUNT inline finding(s) validated against diff" >&2
 # The run still appears in --status; the user gets the receipt + the
 # prior URL via the registry.
 if [ "$INLINE_COUNT" -eq 0 ] && [ -f "$RUN_DIR/past-reviews.json" ]; then
-  PRIOR_URL=$(python3 - "$RUN_DIR/past-reviews.json" <<'PY' 2>/dev/null
+  # Stderr is intentionally NOT suppressed — a malformed past-reviews.json
+  # or unexpected schema should surface as a warning rather than silently
+  # turn into an empty PRIOR_URL (which would proceed to post a no-op
+  # review built on partial assumptions).
+  PRIOR_URL=$(python3 - "$RUN_DIR/past-reviews.json" <<'PY'
 import json, sys
 rs = json.load(open(sys.argv[1])).get('reviews', [])
 print(rs[0]['url'] if rs else '')

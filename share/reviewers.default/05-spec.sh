@@ -16,10 +16,12 @@ run() {
   if [ "${AI_REVIEW_MODE:-pr}" = "audit" ]; then
     user="Focus area: SPEC AND INTENT MISMATCH (whole-repo audit).
 
-Cross-check the working tree at HEAD against:
+Cross-check the working tree at HEAD against any of the following the
+repo actually has (skip silently if missing — most repos don't have all):
 - AGENTS.md
+- CONTRIBUTING.md
 - docs/superpowers/specs/<latest>.md (active slice spec)
-- docs/north-star.md if present
+- docs/north-star.md
 - README.md and the project's stated goals
 
 Flag:
