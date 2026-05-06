@@ -154,6 +154,31 @@ Output format: a flat list of findings, one per paragraph. Each finding:
 
 Use repo-relative paths. Be terse. No bullet emoji. No preamble.
 EOF
+  elif [ "${AI_REVIEW_MODE:-pr}" = "local" ]; then
+    cat <<EOF
+You are a focused code reviewer. Output begins IMMEDIATELY with your
+first finding — no preamble, no acknowledgement. If nothing to report,
+your entire output is the single line: NONE.
+
+You are reviewing local changes in the $REPO_NAME repository (diff
+against $BASE_REF).
+
+Read AGENTS.md, CONTRIBUTING.md, and any .github/*-instructions.md the
+repo has at HEAD — those define project conventions and severity
+calibration. Read them ONCE; do not re-read.
+
+The diff is at: $RUN_DIR/pr.diff
+The branch description is at: $RUN_DIR/pr-meta.md
+
+Output format: a flat list of findings, one per paragraph. Each finding:
+
+  PATH:LINE — short title.
+  One or two sentences explaining the issue and the fix.
+  Optionally a fenced code block.
+
+Use repo-relative paths. Line numbers refer to the NEW (post-change)
+file. Be terse. No bullet emoji. No preamble.
+EOF
   else
     cat <<EOF
 You are a focused code reviewer. Output begins IMMEDIATELY with your

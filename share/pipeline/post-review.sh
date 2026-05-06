@@ -1,11 +1,37 @@
 #!/usr/bin/env bash
 # Pipeline stage: build the PR Review payload from stage-3 (body) and
 # stage-2 (inline comments validated against diff-lines), POST it.
+# In local mode (AI_REVIEW_MODE=local), writes a markdown file instead.
 
 set -uo pipefail
 LIB="${AI_REVIEW_LIB:-$HOME/.local/share/ai-review/lib/common.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
+
+# Local mode: write findings to a local markdown file and exit.
+if [ "${AI_REVIEW_MODE:-pr}" = "local" ]; then
+  LOCAL_REVIEW_DIR="$REPO_ROOT/.ai-review/reviews"
+  mkdir -p "$LOCAL_REVIEW_DIR"
+  STAMP="$(date +%Y-%m-%d-%H%M)"
+  BNAME="$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null | tr '/' '-' || echo "detached")"
+  OUT="$LOCAL_REVIEW_DIR/${STAMP}-${BNAME}.md"
+  {
+    echo "# Local review — $REPO_NAME"
+    echo
+    echo "- Generated: $(date '+%Y-%m-%d %H:%M %Z')"
+    echo "- Branch: \`$BNAME\`  diff against \`$BASE_REF\`"
+    echo "- HEAD: \`${HEAD_SHA:0:7}\`"
+    echo "- Profile: \`$AI_CMD\` (\`$AI_PROFILE_DIR\`)"
+    [ -n "${AI_MODEL:-}" ] && echo "- Model: \`$AI_MODEL\`"
+    echo
+    echo "---"
+    echo
+    cat "$RUN_DIR/stage3.md"
+  } > "$OUT"
+  echo "▸ local review: $OUT" >&2
+  update_run_field review_url "$OUT"
+  exit 0
+fi
 
 REVIEW_PAYLOAD="$RUN_DIR/review-payload.json"
 

@@ -22,6 +22,7 @@
 # Usage:
 #   ai-review                        # full PR-review pipeline
 #   ai-review --audit                # whole-repo audit → local markdown report
+#   ai-review --local                # review local branch diff, no GitHub needed
 #   ai-review --init                 # interactive project setup
 #   ai-review --include foo,bar      # add these
 #   ai-review --exclude runtime-test # skip these
@@ -60,6 +61,7 @@ INIT=false
 STATUS=false
 STATUS_LIMIT=recent
 AUDIT=false
+LOCAL=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --include) INCLUDE="$2"; shift 2 ;;
@@ -70,6 +72,7 @@ while [ $# -gt 0 ]; do
     --keep)    KEEP=true; shift ;;
     --init)    INIT=true; shift ;;
     --audit)   AUDIT=true; shift ;;
+    --local)   LOCAL=true; shift ;;
     --status)
       STATUS=true; shift
       if [ $# -gt 0 ]; then
@@ -79,7 +82,7 @@ while [ $# -gt 0 ]; do
       fi
       ;;
     -h|--help)
-      sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -89,6 +92,10 @@ done
 if $QUICK && $AUDIT; then
   echo "ai-review: --quick and --audit cannot be combined." >&2
   echo "  --quick posts a PR comment; --audit writes a local file." >&2
+  exit 2
+fi
+if $LOCAL && $AUDIT; then
+  echo "ai-review: --local and --audit cannot be combined." >&2
   exit 2
 fi
 
@@ -216,7 +223,12 @@ for (owner, repo), entries in filtered_groups:
     for f, d in entries:
         tasks = load_tasks(f.replace(".run", ".tasks"))
         kind = d.get("kind", "pr")
-        pr = "audit" if kind == "audit" else d.get("pr", "?")
+        if kind == "audit":
+            pr = "audit"
+        elif kind == "local":
+            pr = "local"
+        else:
+            pr = d.get("pr", "?")
         status = d.get("status", "?")
         pid_alive = d.get("pid") and alive(d["pid"])
         if status == "running" and not pid_alive:
@@ -226,10 +238,10 @@ for (owner, repo), entries in filtered_groups:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(started)) if started else "?"
         total = fmt_dur(ended - started) if ended and started else (
             fmt_dur(now - started) if started and status == "running" else "—")
-        # Audit runs link to the local report file. PR runs prefer the
+        # Audit/local runs link to the local report file. PR runs prefer the
         # review-comment URL the post stage captured; fall back to PR URL.
         review_url = d.get("review_url", "").strip()
-        if kind == "audit":
+        if kind in ("audit", "local"):
             url = review_url or "(no report)"
         else:
             pr_url = f"https://github.com/{owner}/{repo}/pull/{pr}" if str(pr).isdigit() and int(pr) > 0 else "(no PR)"
@@ -602,6 +614,30 @@ fi
 # ------------------------------------------------------------------
 # Audit mode skips PR resolution entirely — the audit is whole-repo,
 # anchored to HEAD of the working tree, no diff involved.
+# Local mode resolves a diff against a local base branch without GitHub.
+_pick_local_base() {
+  local _b
+  for _b in main master develop; do
+    if git rev-parse --verify "$_b" >/dev/null 2>&1 && \
+       [ "$(git rev-parse HEAD 2>/dev/null)" != "$(git rev-parse "$_b" 2>/dev/null)" ]; then
+      echo "$_b"; return
+    fi
+  done
+  echo "HEAD~1"
+}
+
+_setup_local_vars() {
+  PR_JSON=""
+  PR_NUM=0
+  HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
+  BASE_REF="$(_pick_local_base)"
+  if [ "$BASE_REF" = "HEAD~1" ]; then
+    BASE_SHA="$(git rev-parse HEAD~1 2>/dev/null || echo "")"
+  else
+    BASE_SHA="$(git merge-base HEAD "$BASE_REF" 2>/dev/null || echo "")"
+  fi
+}
+
 if $AUDIT; then
   PR_JSON=""
   PR_NUM=0
@@ -609,22 +645,39 @@ if $AUDIT; then
   HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
   BASE_SHA=""
 else
-  PR_JSON="$(gh pr view --json number,title,body,baseRefName,headRefOid 2>/dev/null || true)"
-  if [ -z "$PR_JSON" ] && ! $LIST; then
-    echo "no open PR for current branch — push first (or use --audit for whole-repo)" >&2
-    exit 1
+  if ! $LOCAL; then
+    PR_JSON="$(gh pr view --json number,title,body,baseRefName,headRefOid 2>/dev/null || true)"
+    if [ -z "$PR_JSON" ] && ! $LIST; then
+      if ! git remote get-url origin >/dev/null 2>&1; then
+        echo "▸ no GitHub remote — using local review mode" >&2
+        LOCAL=true
+      else
+        echo "no open PR for current branch — push first (or use --audit for whole-repo)" >&2
+        exit 1
+      fi
+    fi
+    if [ -n "$PR_JSON" ]; then
+      PR_NUM=$(jq -r '.number' <<<"$PR_JSON")
+      BASE_REF=$(jq -r '.baseRefName' <<<"$PR_JSON")
+      HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
+    else
+      PR_NUM=0; BASE_REF="main"; HEAD_SHA=""; BASE_SHA=""
+    fi
   fi
-  if [ -n "$PR_JSON" ]; then
-    PR_NUM=$(jq -r '.number' <<<"$PR_JSON")
-    BASE_REF=$(jq -r '.baseRefName' <<<"$PR_JSON")
-    HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
-  else
-    PR_NUM=0; BASE_REF="main"; HEAD_SHA=""; BASE_SHA=""
+  if $LOCAL; then
+    _setup_local_vars
   fi
 fi
-REPO_OWNER=$(gh repo view --json owner --jq .owner.login)
-REPO_NAME=$(gh repo view --json name --jq .name)
-REPO_URL="https://github.com/$REPO_OWNER/$REPO_NAME"
+
+if $LOCAL || $AUDIT; then
+  REPO_OWNER="local"
+  REPO_NAME="$(basename "${REPO_ROOT:-$PWD}")"
+  REPO_URL="local://${REPO_ROOT:-$PWD}"
+else
+  REPO_OWNER=$(gh repo view --json owner --jq .owner.login)
+  REPO_NAME=$(gh repo view --json name --jq .name)
+  REPO_URL="https://github.com/$REPO_OWNER/$REPO_NAME"
+fi
 
 # Per-repo App config lookup.
 APP_CONF="$APPS_DIR/${REPO_OWNER}__${REPO_NAME}.conf"
@@ -653,10 +706,12 @@ resolve_identity() {
       ;;
   esac
 }
-resolve_identity
+if ! $LOCAL; then
+  resolve_identity
+fi
 
 # Mint App installation token if applicable.
-if [ -n "$APP_CONF" ]; then
+if [ -n "$APP_CONF" ] && ! $LOCAL; then
   if ! python3 -c 'import cryptography' >/dev/null 2>&1; then
     echo "ai-review: App auth requires the Python 'cryptography' package." >&2
     echo "  install with: python3 -m pip install --user cryptography" >&2
@@ -714,7 +769,9 @@ PY
 fi
 export APP_TOKEN
 
-if [ -n "$APP_TOKEN" ]; then
+if $LOCAL; then
+  IDENTITY="local"
+elif [ -n "$APP_TOKEN" ]; then
   IDENTITY="${APP_SLUG:-ai-review}[bot]"
 else
   IDENTITY="$(gh api user --jq .login 2>/dev/null || echo 'gh-user')"
@@ -723,6 +780,8 @@ fi
 if ! $LIST; then
   if $AUDIT; then
     echo "▸ audit (HEAD ${HEAD_SHA:0:7}) — writing local report (cmd: $AI_CMD)" >&2
+  elif $LOCAL; then
+    echo "▸ local review ($BASE_REF → ${HEAD_SHA:0:7}) — writing local report (cmd: $AI_CMD)" >&2
   else
     echo "▸ PR #$PR_NUM ($BASE_REF → ${HEAD_SHA:0:7}) — posting as $IDENTITY (cmd: $AI_CMD)" >&2
   fi
@@ -760,6 +819,7 @@ STATE_FILE="$STATE_DIR/${REPO_OWNER}__${REPO_NAME}__${RUN_ID}.run"
   echo "pid=$$"
   echo "status=running"
   $AUDIT && echo "kind=audit"
+  $LOCAL && echo "kind=local"
 } > "$STATE_FILE"
 
 mark_done() {
@@ -796,6 +856,20 @@ if [ -n "$PR_JSON" ]; then
   gh pr view "$PR_NUM" --json title,body \
     --jq '"# " + .title + "\n\n" + (.body // "(no description)")' \
     > "$RUN_DIR/pr-meta.md"
+elif $LOCAL; then
+  if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+    git diff "$BASE_SHA..$HEAD_SHA" > "$RUN_DIR/pr.diff"
+  else
+    touch "$RUN_DIR/pr.diff"
+  fi
+  if [ "$(wc -c < "$RUN_DIR/pr.diff")" -gt 600000 ]; then
+    head -c 600000 "$RUN_DIR/pr.diff" > "$RUN_DIR/pr.diff.trunc"
+    printf '\n[diff truncated to 600K bytes]\n' >> "$RUN_DIR/pr.diff.trunc"
+    mv "$RUN_DIR/pr.diff.trunc" "$RUN_DIR/pr.diff"
+  fi
+  BRANCH_NAME="$(git symbolic-ref --short HEAD 2>/dev/null || echo "(detached)")"
+  printf '# Local review: %s\n\nDiff against `%s`.\n' "$BRANCH_NAME" "$BASE_REF" \
+    > "$RUN_DIR/pr-meta.md"
 fi
 
 # Export everything reviewer scripts need.
@@ -804,9 +878,12 @@ export AI_CMD AI_PROFILE_DIR AI_MODEL
 export STATE_FILE
 export RUN_DIR REPO_ROOT REPO_OWNER REPO_NAME REPO_URL
 export PR_NUM BASE_REF BASE_SHA HEAD_SHA MODEL="$AI_MODEL"
+export LOCAL
 # Mode flag for stage-1 reviewers and lib helpers that branch on PR vs audit.
 if $AUDIT; then
   export AI_REVIEW_MODE=audit
+elif $LOCAL; then
+  export AI_REVIEW_MODE=local
 else
   export AI_REVIEW_MODE=pr
 fi
@@ -881,10 +958,10 @@ while IFS='|' read -r b script; do
   fi
 
   # Audit mode: applies() relies on diff_touches which has no diff to look
-  # at — run every discovered reviewer instead. PR mode: honor applies().
+  # at — run every discovered reviewer instead. PR/local mode: honor applies().
   if $AUDIT; then
     TO_RUN+=("$script:$name")
-  elif [ -n "$PR_JSON" ] && bash "$script" applies 2>/dev/null; then
+  elif ( [ -n "$PR_JSON" ] || $LOCAL ) && bash "$script" applies 2>/dev/null; then
     TO_RUN+=("$script:$name")
   else
     SKIPPED+=("$name (applies()=false)")
@@ -942,7 +1019,7 @@ fi
 
 # No-content guard: if every reviewer output is empty or "NONE", there's
 # nothing to post. Stages 2-4 would still run and emit an empty body.
-if ! $AUDIT; then
+if ! $AUDIT && ! $LOCAL; then
   has_content=false
   for entry in "${TO_RUN[@]}"; do
     name="${entry##*:}"
@@ -985,7 +1062,16 @@ print(json.dumps({
 PY
 )
   echo "$PAYLOAD" > "$RUN_DIR/payload.json"
-  if [ -n "$APP_TOKEN" ]; then
+  if $LOCAL; then
+    LOCAL_REVIEW_DIR="$REPO_ROOT/.ai-review/reviews"
+    mkdir -p "$LOCAL_REVIEW_DIR"
+    STAMP="$(date +%Y-%m-%d-%H%M)"
+    BNAME="$(git symbolic-ref --short HEAD 2>/dev/null | tr '/' '-' || echo "detached")"
+    LOCAL_OUT="$LOCAL_REVIEW_DIR/${STAMP}-${BNAME}.md"
+    cp "$RUN_DIR/summary.md" "$LOCAL_OUT"
+    echo "▸ local review: $LOCAL_OUT" >&2
+    update_run_field review_url "$LOCAL_OUT"
+  elif [ -n "$APP_TOKEN" ]; then
     HTTP_CODE=$(curl -sS -o "$RUN_DIR/payload.resp" -w '%{http_code}' \
       -X POST \
       -H "Authorization: Bearer $APP_TOKEN" \
@@ -998,14 +1084,15 @@ PY
       head -10 "$RUN_DIR/payload.resp" >&2
       exit 1
     fi
+    echo "▸ posted quick review" >&2
   else
     if ! gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUM/reviews" \
         --input "$RUN_DIR/payload.json" >/dev/null; then
       echo "▸ quick post failed (gh api)" >&2
       exit 1
     fi
+    echo "▸ posted quick review" >&2
   fi
-  echo "▸ posted quick review" >&2
 elif $AUDIT; then
   # Audit mode: skip stages 2/3/4 (no diff, no GitHub post) — concat
   # stage-1 outputs into <repo>/.ai-review/audits/YYYY-MM-DD-HHMM.md.
@@ -1013,9 +1100,11 @@ elif $AUDIT; then
 else
   # Past-reviews fetch runs AFTER stage 1 so reviewers form findings
   # without bias from prior runs, but BEFORE stage 2 so dedupe + cross-
-  # reference can use them.
-  echo "▸ fetching prior reviews on PR #$PR_NUM..." >&2
-  bash "$SHARE/helpers/fetch-past-reviews.sh"
+  # reference can use them. Local mode has no prior GitHub reviews to fetch.
+  if ! $LOCAL; then
+    echo "▸ fetching prior reviews on PR #$PR_NUM..." >&2
+    bash "$SHARE/helpers/fetch-past-reviews.sh"
+  fi
   bash "$SHARE/pipeline/extract-line-findings.sh"
   bash "$SHARE/pipeline/consolidate-summary.sh"
   bash "$SHARE/pipeline/post-review.sh"
