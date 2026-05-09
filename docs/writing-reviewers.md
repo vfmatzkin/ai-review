@@ -64,6 +64,23 @@ esac
 | `call_claude <name> <tools> <sys> <user> <out> <transcript> [secs]` | spawn the model |
 | `gh_api` | authenticated `gh api` (uses App token if available) |
 
+## Cross-cutting context files
+
+Before stage 1 runs, the orchestrator pre-fetches three context files
+every reviewer can Read on demand. They're soft-fail: if a fetch
+errors (no Actions on this repo, restricted token, no related PRs),
+a stub is written so reviewers can unconditionally Read them.
+
+| File | What's in it | Useful for |
+|---|---|---|
+| `$RUN_DIR/pr.diff` | the PR's unified diff | every reviewer |
+| `$RUN_DIR/pr-meta.md` | PR title + description | `intent`, any reviewer cross-checking what the contributor said |
+| `$RUN_DIR/ci-status.md` | latest GitHub Actions runs for HEAD_SHA, with failed-step log excerpts | `runtime-truth` (empirical parity), `risk` (CI-flagged failures) |
+| `$RUN_DIR/related-prs.md` | last few merged PRs that touched the same files | `intent` (drift), `dryness` (rewrite cycles), `architecture` (recurring layer violations) |
+
+Read only what your focus area benefits from. The defaults' prompts
+include guidance on which to consume.
+
 ## What makes a good reviewer
 
 **Be specific about the focus.** A reviewer titled "general code review"

@@ -59,17 +59,27 @@ To re-enter the wizard later: `ai-review --init`.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Stage 1: each reviewer (sequential, scoped tool surface)            │
-│    01-correctness  → stage1/correctness.md   ┐                       │
-│    03-security     → stage1/security.md      ├ shipped global defaults│
-│    04-tests        → stage1/tests.md         │  (gaps at 02 / 06+    │
-│    05-spec         → stage1/spec.md          ┘   left for projects)  │
-│    NN-<your name>  → stage1/<name>.md   (project-specific overrides) │
+│  Pre-stage: orchestrator-fetched cross-cutting context               │
+│    pr.diff, pr-meta.md (PR description),                             │
+│    ci-status.md (latest GitHub Actions runs for HEAD_SHA),           │
+│    related-prs.md (last few merged PRs that touched the same files)  │
+│  Reviewers Read these on demand — read what helps your focus.        │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────────────┐
-│  Past-reviews fetch — pull prior bot reviews on this PR (top 5)      │
-│  Runs AFTER stage 1 so reviewers form findings without bias.         │
+│  Stage 1: each reviewer (sequential, scoped tool surface, 5 angles)  │
+│    01-runtime-truth  → empirical (build/test + CI)                   │
+│    02-architecture   → static structure + layer discipline           │
+│    03-dryness        → DRY / SOLID / dead code / rewrite cycles      │
+│    04-risk           → adversarial: failure modes + security         │
+│    05-intent         → diff vs PR description vs spec vs cross-PR    │
+│    NN-<your name>    → project-specific additions / overrides        │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────────────────┐
+│  Past-reviews fetch — prior bot reviews on this PR + this bot's      │
+│  reviews on OTHER recent PRs. Runs AFTER stage 1 so reviewers form   │
+│  findings without bias from prior runs.                              │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────────────┐
@@ -79,7 +89,9 @@ To re-enter the wizard later: `ai-review --init`.
                              │
 ┌────────────────────────────▼─────────────────────────────────────────┐
 │  Stage 3: consolidate — write the prose summary body                 │
-│           Opens with "Builds on …" link list when prior reviews exist.│
+│           Opens with "Builds on …" link list when prior reviews exist│
+│           Adds a "## Patterns" section when cross-pr-reviews.md      │
+│           shows the bot has flagged the same concern across N PRs.   │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────────────┐
@@ -131,16 +143,26 @@ Discovery order, by basename:
 ~/.local/share/ai-review/reviewers.default/*.sh   # globals
 ```
 
-The included global defaults:
+The included global defaults — five complementary angles, no overlap
+by design (test-coverage gaps fold into each angle's own focus area
+rather than living in a separate `tests` reviewer):
 
 | Reviewer | Focus | Applies when |
 |---|---|---|
-| `01-correctness.sh` | error-path correctness, races, cleanup, cancellation safety | diff touches a common code-file extension (rs/ts/py/go/rb/etc.) |
-| `03-security.sh` | injection, secret leaks, auth-token handling | any non-empty diff |
-| `04-tests.sh` | coverage gaps, mocked-away seams, missing edge cases | diff touches a common code-file extension |
-| `05-spec.sh` | diff-vs-PR-description, conventions docs | any non-empty diff |
+| `01-runtime-truth.sh` | empirical: build + test (auto-detected for Cargo / npm / pytest / make) AND GitHub Actions CI parity | non-empty diff |
+| `02-architecture.sh` | dependency direction, layer/module boundaries, port/adapter discipline, public-API surface | diff touches a code file |
+| `03-dryness.sh` | DRY violations across files, dead code, rewrite cycles via code_archaeology | diff touches a code file |
+| `04-risk.sh` | adversarial: failure modes (races, cleanup, cancellation, panic safety) + security (injection, secrets, traversal) | any non-empty diff |
+| `05-intent.sh` | diff vs PR description vs project docs (AGENTS.md / CONTRIBUTING / specs); cross-PR drift via `related-prs.md` | any non-empty diff |
 
-The code-file regex covers the common-case languages out of the box —
+Defaults are **language-agnostic, Python-first** — they recognize
+Python (`pyproject.toml` + pytest) out of the box and have concrete
+Python idioms in their prompts (asyncio races, bare `except:`,
+`__del__` quirks, etc.). For Rust / Go / TS projects you'll usually
+want a project override at `<repo>/.ai-review/reviewers/NN-*.sh` that
+names the precise crate / package layout invariants.
+
+The code-file regex covers common-case languages out of the box —
 narrow it in your project override if you want a tighter filter.
 
 To customize, copy them into your project (`ai-review --init` does this

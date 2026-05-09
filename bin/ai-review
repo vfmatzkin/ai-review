@@ -888,6 +888,26 @@ else
   export AI_REVIEW_MODE=pr
 fi
 
+# Pre-stage-1 context fetches. These run BEFORE stage 1 so every
+# reviewer can read $RUN_DIR/ci-status.md and $RUN_DIR/related-prs.md
+# without re-querying. Both are soft-fail: any GH API issue writes a
+# "no data" stub and exits 0, so reviewers see consistent file shapes
+# even on repos without Actions or with restricted token scopes.
+#
+# Skipped in audit mode: there's no diff to anchor related-prs against,
+# and audits are run-locally-on-demand artifacts where CI parity isn't
+# the goal. Reviewers in audit mode still get useful stubs.
+if [ "$AI_REVIEW_MODE" != "audit" ]; then
+  bash "$SHARE/helpers/fetch-ci-output.sh" || true
+  bash "$SHARE/helpers/fetch-related-prs.sh" || true
+else
+  # Audit mode: write stubs so reviewers can unconditionally Read these files.
+  echo '[]' > "$RUN_DIR/ci-status.json"
+  printf '# CI status\n\n_Audit mode — no diff, no CI fetch._\n' > "$RUN_DIR/ci-status.md"
+  echo '{"files":[],"prs":[]}' > "$RUN_DIR/related-prs.json"
+  printf '# Related PRs\n\n_Audit mode — no diff to query against._\n' > "$RUN_DIR/related-prs.md"
+fi
+
 # ------------------------------------------------------------------
 # Reviewer discovery: project overrides global by basename.
 # ------------------------------------------------------------------
@@ -1104,6 +1124,11 @@ else
   if ! $LOCAL; then
     echo "▸ fetching prior reviews on PR #$PR_NUM..." >&2
     bash "$SHARE/helpers/fetch-past-reviews.sh"
+    # Also fetch this bot's reviews on OTHER recent PRs in the repo so
+    # stage 3 can surface RECURRING patterns (issues we've flagged
+    # repeatedly that the project hasn't addressed at root).
+    echo "▸ fetching cross-PR review history..." >&2
+    bash "$SHARE/helpers/fetch-cross-pr-reviews.sh" || true
   fi
   bash "$SHARE/pipeline/extract-line-findings.sh"
   bash "$SHARE/pipeline/consolidate-summary.sh"
