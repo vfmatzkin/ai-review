@@ -27,10 +27,13 @@ fi
 
 CROSS_PR_BLOCK=""
 PATTERNS_RULE=""
-if [ -f "$RUN_DIR/cross-pr-reviews.md" ] \
-    && ! grep -q "^_" "$RUN_DIR/cross-pr-reviews.md" 2>/dev/null; then
-  # cross-pr-reviews.md exists AND isn't the empty-stub form (\"_no
-  # reviews_\" stubs all start with an underscore-italics line).
+if [ -f "$RUN_DIR/cross-pr-reviews.json" ] \
+    && python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if d.get('reviews') else 1)
+" "$RUN_DIR/cross-pr-reviews.json" 2>/dev/null; then
+  # cross-pr-reviews.json has a non-empty reviews array (not a stub).
   CROSS_PR_BLOCK="
 - Cross-PR review history (this bot, last few PRs): $RUN_DIR/cross-pr-reviews.md"
   PATTERNS_RULE="

@@ -66,7 +66,7 @@ esac
 
 ## Cross-cutting context files
 
-Before stage 1 runs, the orchestrator pre-fetches three context files
+Before stage 1 runs, the orchestrator pre-fetches four context files
 every reviewer can Read on demand. They're soft-fail: if a fetch
 errors (no Actions on this repo, restricted token, no related PRs),
 a stub is written so reviewers can unconditionally Read them.

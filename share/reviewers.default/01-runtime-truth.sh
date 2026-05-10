@@ -22,12 +22,15 @@
 # runners). The override pattern is: copy this file into
 # `<repo>/.ai-review/reviewers/01-runtime-truth.sh` and tailor.
 #
-# Sandbox model:
+# Worktree isolation:
 # - Worktree mounted at $RUN_DIR/wt (separate working copy of HEAD_SHA)
 # - claudea's Bash allowlist restricted to read-only inspection
 # - Anything claudea runs lives in the worktree dir; can't touch the
 #   primary checkout or anything outside the worktree's tree
 # - Worktree torn down on exit
+# - NOTE: this is NOT an execution sandbox — build/test commands can still
+#   access the network, user home, and credentials. Use --exclude runtime-truth
+#   or project-specific sandboxing if that's a concern.
 #
 # This is the most expensive reviewer (build is multi-minute on Rust
 # / Java / large monorepos); easy to opt out via --exclude runtime-truth.
@@ -72,18 +75,26 @@ scr = pkg.get('scripts') or {}
 sys.exit(0 if 'test' in scr else 1)
 " 2>/dev/null; then
       BUILD_LABEL="npm"
-      BUILD_CMD="npm install --no-audit --no-fund --prefer-offline"
+      # --ignore-scripts prevents lifecycle hooks (preinstall/postinstall) from
+      # running arbitrary code from the PR. Some packages need them to build
+      # native addons — if tests fail, a project override can drop this flag.
+      BUILD_CMD="npm install --no-audit --no-fund --prefer-offline --ignore-scripts"
       TEST_CMD="npm test --silent"
       return 0
     fi
   fi
   if [ -f "$REPO_ROOT/pyproject.toml" ] || [ -f "$REPO_ROOT/setup.py" ]; then
-    if grep -qE '(^|[[:space:]])pytest($|[[:space:]<>=])' \
-        "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/setup.py" \
-        "$REPO_ROOT/requirements.txt" 2>/dev/null; then
+    # Build the grep target list from only existing files to avoid exit 2.
+    _py_files=()
+    for _f in "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/setup.py" "$REPO_ROOT/requirements.txt"; do
+      [ -f "$_f" ] && _py_files+=("$_f")
+    done
+    if grep -qE '(^|[[:space:]])pytest($|[[:space:]<>=])' "${_py_files[@]}" 2>/dev/null; then
       BUILD_LABEL="python"
-      BUILD_CMD="python3 -m pip install -e . --quiet"
-      TEST_CMD="python3 -m pytest -q"
+      # Install into an isolated virtualenv so we don't touch the user/global env.
+      VENV_DIR="$RUN_DIR/venv"
+      BUILD_CMD="python3 -m venv '$VENV_DIR' && '$VENV_DIR/bin/pip' install -e . --quiet"
+      TEST_CMD="'$VENV_DIR/bin/python' -m pytest -q"
       return 0
     fi
   fi

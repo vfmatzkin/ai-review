@@ -120,7 +120,7 @@ json.dump({"bot": bot, "reviews": items}, open(json_out, "w"), indent=2)
 
 with open(md_out, "w") as f:
     f.write(f"# Cross-PR review history — `{bot}` on this repo\n\n")
-    f.write(f"Last {len(items)} review(s) this bot posted on OTHER PRs in {sys.argv[1].split('/')[-2] if '/' in sys.argv[1] else 'this repo'}. ")
+    f.write(f"Last {len(items)} review(s) this bot posted on OTHER PRs in this repo. ")
     f.write("Stage 3 uses this to surface RECURRING patterns — issues the bot ")
     f.write("has flagged on multiple PRs but the project hasn't addressed at root.\n\n")
     f.write("---\n\n")

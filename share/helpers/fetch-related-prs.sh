@@ -9,9 +9,12 @@
 #   $RUN_DIR/related-prs.md     — prose: condensed for model consumption
 #
 # Heuristic:
-#   - Top N most-touched files in the current diff (capped to keep the
-#     `gh` budget bounded).
-#   - For each, query merged PRs touching that file (last M).
+#   - First N unique changed files from the diff (lexicographic; capped
+#     to keep the `gh` budget bounded).
+#   - For each, query merged PRs via the GitHub search API using the file
+#     path as a text query — this is a heuristic: it matches PRs whose
+#     title/body/comments mention the path, NOT a reliable "touched file"
+#     lookup. Results may include false positives and miss some real PRs.
 #   - Dedupe across files; keep the K most recent unique PRs.
 #   - For each kept PR: title, body (truncated), final review summary
 #     (most recent non-bot review), accepted / rejected hints.
@@ -162,7 +165,8 @@ json.dump({"files": files, "prs": prs}, open(json_out, "w"), indent=2)
 
 with open(md_out, "w") as f:
     f.write(f"# Related PRs ({len(prs)} found)\n\n")
-    f.write("These merged PRs touched at least one of the files in the current diff. ")
+    f.write("These merged PRs matched a heuristic text search (title/body/comments) for "
+            "the file paths in the current diff — not a guaranteed 'touched this file' lookup. ")
     f.write("Use them to spot recurring drift, rewrite cycles, or whether the current ")
     f.write("change re-treads ground that an earlier PR already settled.\n\n")
     f.write("**Files queried:**\n\n")
