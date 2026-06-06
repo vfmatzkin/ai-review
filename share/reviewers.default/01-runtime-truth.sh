@@ -186,7 +186,7 @@ If everything passed locally and on CI with no warnings of substance, output: NO
   call_claude "$NAME" \
     "Read Glob Grep Bash(cargo *) Bash(npm *) Bash(python3 *) Bash(make *) Bash(git diff *) Bash(git log *) Bash(git show *)" \
     "$sys" "$user" \
-    "$RUN_DIR/stage1/$NAME.md" "$RUN_DIR/stage1/$NAME.transcript" 600
+    "$RUN_DIR/stage1/$NAME.md" "$RUN_DIR/stage1/$NAME.transcript" "${AI_TIMEOUT:-1200}"
 }
 
 case "${1:-run}" in

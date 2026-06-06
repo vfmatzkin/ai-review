@@ -17,7 +17,7 @@ Designed to be:
 
 Drives the [Claude Code](https://docs.claude.com/en/docs/claude-code/)
 CLI under the hood. If you've configured `claude` to talk to a non-
-Anthropic backend (Bedrock, Vertex, an adapter to DashScope/Qwen, etc.),
+Anthropic backend (Bedrock, Vertex, a custom adapter, etc.),
 ai-review uses whatever profile you point it at.
 
 ## Install

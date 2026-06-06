@@ -62,6 +62,7 @@ STATUS=false
 STATUS_LIMIT=recent
 AUDIT=false
 LOCAL=false
+NO_RESUME=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --include) INCLUDE="$2"; shift 2 ;;
@@ -73,6 +74,7 @@ while [ $# -gt 0 ]; do
     --init)    INIT=true; shift ;;
     --audit)   AUDIT=true; shift ;;
     --local)   LOCAL=true; shift ;;
+    --no-resume) NO_RESUME=true; shift ;;
     --status)
       STATUS=true; shift
       if [ $# -gt 0 ]; then
@@ -802,9 +804,40 @@ fi
 # ------------------------------------------------------------------
 # Run dir + diff + PR meta.
 # ------------------------------------------------------------------
-RUN_ID="pr${PR_NUM}-$(date +%s)"
-RUN_DIR="/tmp/ai-review/$RUN_ID"
+# Resume: if a previous run for this PR + HEAD exists with usable stage-1
+# output, reuse its dir instead of starting fresh. Reviewers that already
+# completed cleanly are skipped in the loop below. Pass --no-resume to
+# force a brand-new run. Auto-skipped for --list / --audit / --local.
+RUN_ID=""
+RUN_DIR=""
+RESUMED=false
+if ! $NO_RESUME && ! $LIST && ! $AUDIT && ! $LOCAL && [ -n "$HEAD_SHA" ]; then
+  for d in $(ls -dt /tmp/ai-review/pr${PR_NUM}-* 2>/dev/null); do
+    [ -d "$d/stage1" ] || continue
+    [ -f "$d/head_sha" ] || continue
+    [ "$(cat "$d/head_sha" 2>/dev/null)" = "$HEAD_SHA" ] || continue
+    # Need at least one cleanly-completed reviewer to be worth resuming.
+    have_clean=false
+    for f in "$d"/stage1/*.md; do
+      [ -s "$f" ] || continue
+      grep -q "reviewer exited non-zero" "$f" && continue
+      have_clean=true; break
+    done
+    $have_clean || continue
+    RUN_DIR="$d"
+    RUN_ID="${RUN_DIR##*/}"
+    RESUMED=true
+    rm -f "$RUN_DIR/.cancelled"
+    echo "▸ resuming run $RUN_ID (--no-resume to start fresh)" >&2
+    break
+  done
+fi
+if [ -z "$RUN_ID" ]; then
+  RUN_ID="pr${PR_NUM}-$(date +%s)"
+  RUN_DIR="/tmp/ai-review/$RUN_ID"
+fi
 mkdir -p "$RUN_DIR/stage1"
+[ -n "$HEAD_SHA" ] && echo "$HEAD_SHA" > "$RUN_DIR/head_sha"
 
 # Global run registry — one file per run, updated on exit.
 STATE_FILE="$STATE_DIR/${REPO_OWNER}__${REPO_NAME}__${RUN_ID}.run"
@@ -835,7 +868,9 @@ mark_done() {
       if [ "$rc" -eq 0 ]; then echo "status=done"; else echo "status=failed"; fi
     } > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
   fi
-  if ! $KEEP && ! $LIST; then rm -rf "$RUN_DIR"; fi
+  # Preserve RUN_DIR if anything went wrong so the next invocation can
+  # resume. Only blow it away on a clean exit (0) unless --keep is set.
+  if ! $KEEP && ! $LIST && [ "$rc" -eq 0 ]; then rm -rf "$RUN_DIR"; fi
 }
 trap mark_done EXIT
 
@@ -1021,6 +1056,17 @@ fi
 echo "▸ stage 1: running ${#TO_RUN[@]} reviewer(s)" >&2
 for entry in "${TO_RUN[@]}"; do
   script="${entry%%:*}"
+  name="${entry##*:}"
+  # Resume: skip reviewers that already produced a clean output. A failed
+  # reviewer leaves a "_(reviewer exited non-zero …)_" marker in its .md,
+  # so those are re-run.
+  if $RESUMED; then
+    out="$RUN_DIR/stage1/$name.md"
+    if [ -s "$out" ] && ! grep -q "reviewer exited non-zero" "$out"; then
+      echo "  • [$name] cached ($(wc -c < "$out" | tr -d ' ') bytes, resumed)" >&2
+      continue
+    fi
+  fi
   bash "$script" run || true
 done
 echo "▸ stage 1 complete" >&2
