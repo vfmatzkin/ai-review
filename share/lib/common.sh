@@ -73,7 +73,18 @@ call_claude() {
 
   # Build env via an array so each VAR=value pair is one shell word
   # regardless of $MODEL contents (spaces, globs, quotes, etc.).
-  local -a env_args=(CLAUDE_CONFIG_DIR="$AI_PROFILE_DIR")
+  #
+  # Only override CLAUDE_CONFIG_DIR for a NON-default profile (e.g. a
+  # ~/.claude-<name> dir holding its own API-key / base-URL creds, like the
+  # claudea/Qwen profile). For the DEFAULT ~/.claude profile, leave
+  # CLAUDE_CONFIG_DIR UNSET: macOS Claude Code stores its OAuth login in the
+  # keychain, and `claude` reads that login ONLY when the var is unset —
+  # setting it (even to ~/.claude itself) forces file-based creds and yields
+  # "Not logged in". Unset == use the keychain-authenticated default account.
+  local -a env_args=()
+  if [ -n "$AI_PROFILE_DIR" ] && [ "$AI_PROFILE_DIR" != "$HOME/.claude" ]; then
+    env_args+=(CLAUDE_CONFIG_DIR="$AI_PROFILE_DIR")
+  fi
   if [ -n "$MODEL" ]; then
     env_args+=(ANTHROPIC_MODEL="$MODEL")
     env_args+=(ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL")

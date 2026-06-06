@@ -102,7 +102,7 @@ Be conservative on duplication: a finding here should be
 common shape."
 
   call_claude "$NAME" "$STAGE1_TOOLS" "$sys" "$user" \
-    "$RUN_DIR/stage1/$NAME.md" "$RUN_DIR/stage1/$NAME.transcript" 600
+    "$RUN_DIR/stage1/$NAME.md" "$RUN_DIR/stage1/$NAME.transcript" "${AI_TIMEOUT:-1200}"
 }
 
 case "${1:-run}" in

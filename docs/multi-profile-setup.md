@@ -21,27 +21,18 @@ when it spawns each reviewer.
 
 The author runs three Claude profiles on the same machine:
 
-| Profile dir              | Backend                                        | Shell alias |
-|--------------------------|------------------------------------------------|-------------|
-| `~/.claude`              | Anthropic API (default)                        | `claude`    |
-| `~/.claude-alibaba`      | Alibaba DashScope, via a local adapter on :3082 | `claudea`   |
-| `~/.claude-qwen`         | Qwen direct (used at work)                     | `claudeq`   |
+| Profile dir              | Backend                                                  | Shell alias |
+|--------------------------|----------------------------------------------------------|-------------|
+| `~/.claude`              | Anthropic API (default)                                  | `claude`    |
+| `~/.claude-alibaba`      | Alibaba DashScope via its Anthropic-compatible endpoint  | `claudea`   |
+| `~/.claude-qwen`         | Qwen direct (used at work)                               | `claudeq`   |
 
-The `claudea` / `claudeq` shell functions look roughly like:
+The `claudea` / `claudeq` shell functions just point `CLAUDE_CONFIG_DIR`
+at the right profile:
 
 ```bash
-claudea() {
-  # Spin up the local adapter if it isn't already listening.
-  if ! lsof -i :3082 -sTCP:LISTEN -t &>/dev/null; then
-    tmux new-session -d -s cc-adapter-alibaba 'node ~/.claude-adapter-alibaba/server.js'
-    # ...wait for it...
-  fi
-  CLAUDE_CONFIG_DIR=$HOME/.claude-alibaba claude "$@"
-}
-
-claudeq() {
-  CLAUDE_CONFIG_DIR=$HOME/.claude-qwen claude "$@"
-}
+claudea() { CLAUDE_CONFIG_DIR=$HOME/.claude-alibaba claude "$@"; }
+claudeq() { CLAUDE_CONFIG_DIR=$HOME/.claude-qwen    claude "$@"; }
 ```
 
 **ai-review does not call `claudea`/`claudeq`.** It always calls plain
@@ -51,15 +42,14 @@ To get the same behavior under ai-review, the author's per-repo
 `.ai-review/config` files set:
 
 ```bash
-# personal repo (uses Alibaba/Qwen via the adapter)
+# personal repo (Alibaba via Anthropic-compatible endpoint)
 AI_CMD=claudea
 AI_PROFILE_DIR=$HOME/.claude-alibaba
 AI_MODEL=qwen3.6-plus
-AI_PRELAUNCH='lsof -i :3082 -t >/dev/null || tmux new-session -d -s cc-adapter-alibaba "node $HOME/.claude-adapter-alibaba/server.js"'
 ```
 
 ```bash
-# work repo (uses Qwen direct, no adapter)
+# work repo (uses Qwen direct)
 AI_CMD=claudeq
 AI_PROFILE_DIR=$HOME/.claude-qwen
 ```
@@ -74,8 +64,8 @@ If you only have one Claude profile, you don't need any of this — the
 defaults (`AI_PROFILE_DIR=$HOME/.claude`, `AI_CMD=default`) work as-is.
 
 If you have multiple, set `AI_PROFILE_DIR` per repo (or globally in
-`~/.config/ai-review/config`). Use `AI_PRELAUNCH` for any setup the
-profile needs that isn't already running.
+`~/.config/ai-review/config`). Use `AI_PRELAUNCH` for any setup a
+profile needs that isn't already running (local proxy, tunnel, etc.).
 
 ## Why a label at all?
 
