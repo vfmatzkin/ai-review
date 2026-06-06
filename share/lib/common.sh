@@ -75,8 +75,8 @@ call_claude() {
   # regardless of $MODEL contents (spaces, globs, quotes, etc.).
   #
   # Only override CLAUDE_CONFIG_DIR for a NON-default profile (e.g. a
-  # ~/.claude-<name> dir holding its own API-key / base-URL creds, like the
-  # claudea/Qwen profile). For the DEFAULT ~/.claude profile, leave
+  # ~/.claude-<name> dir holding its own API-key / base-URL creds, like an
+  # alternate-backend profile). For the DEFAULT ~/.claude profile, leave
   # CLAUDE_CONFIG_DIR UNSET: macOS Claude Code stores its OAuth login in the
   # keychain, and `claude` reads that login ONLY when the var is unset —
   # setting it (even to ~/.claude itself) forces file-based creds and yields

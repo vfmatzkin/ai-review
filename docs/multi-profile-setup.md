@@ -24,34 +24,34 @@ The author runs three Claude profiles on the same machine:
 | Profile dir              | Backend                                                  | Shell alias |
 |--------------------------|----------------------------------------------------------|-------------|
 | `~/.claude`              | Anthropic API (default)                                  | `claude`    |
-| `~/.claude-alibaba`      | Alibaba DashScope via its Anthropic-compatible endpoint  | `claudea`   |
-| `~/.claude-qwen`         | Qwen direct (used at work)                               | `claudeq`   |
+| `~/.claude-alt`          | A non-Anthropic backend via an Anthropic-compatible endpoint | `claudea` |
+| `~/.claude-work`         | A separate work account                                 | `claudew`   |
 
-The `claudea` / `claudeq` shell functions just point `CLAUDE_CONFIG_DIR`
+The `claudea` / `claudew` shell functions just point `CLAUDE_CONFIG_DIR`
 at the right profile:
 
 ```bash
-claudea() { CLAUDE_CONFIG_DIR=$HOME/.claude-alibaba claude "$@"; }
-claudeq() { CLAUDE_CONFIG_DIR=$HOME/.claude-qwen    claude "$@"; }
+claudea() { CLAUDE_CONFIG_DIR=$HOME/.claude-alt  claude "$@"; }
+claudew() { CLAUDE_CONFIG_DIR=$HOME/.claude-work claude "$@"; }
 ```
 
-**ai-review does not call `claudea`/`claudeq`.** It always calls plain
+**ai-review does not call `claudea`/`claudew`.** It always calls plain
 `claude`. The aliases exist only for interactive use.
 
 To get the same behavior under ai-review, the author's per-repo
 `.ai-review/config` files set:
 
 ```bash
-# personal repo (Alibaba via Anthropic-compatible endpoint)
+# personal repo (non-Anthropic backend via Anthropic-compatible endpoint)
 AI_CMD=claudea
-AI_PROFILE_DIR=$HOME/.claude-alibaba
-AI_MODEL=qwen3.6-plus
+AI_PROFILE_DIR=$HOME/.claude-alt
+AI_MODEL=your-model-name
 ```
 
 ```bash
-# work repo (uses Qwen direct)
-AI_CMD=claudeq
-AI_PROFILE_DIR=$HOME/.claude-qwen
+# work repo (separate work account)
+AI_CMD=claudew
+AI_PROFILE_DIR=$HOME/.claude-work
 ```
 
 `AI_CMD` is just a label — it shows up in logs and in
@@ -71,5 +71,5 @@ profile needs that isn't already running (local proxy, tunnel, etc.).
 
 Without `AI_CMD`, the run registry (`ai-review --status`) couldn't tell
 you which backend produced which review. With it, `--status` shows
-`cmd: claudeq` and you know whether the review came out of your work
+`cmd: claudew` and you know whether the review came out of your work
 account or your personal one.
