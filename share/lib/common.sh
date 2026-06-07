@@ -67,6 +67,10 @@ call_claude() {
   local before="$RUN_DIR/.snap-$name"
   snapshot_transcripts > "$before"
 
+  # Clear any stale failure artifact from a prior (resumed) run so a
+  # now-successful reviewer isn't later mistaken for a failed one.
+  rm -f "$out.failed"
+
   echo "  • [$name] thinking (timeout ${secs}s)..." >&2
   local start; start=$(date +%s)
   update_run_field current "$name"
@@ -108,14 +112,25 @@ call_claude() {
     # Signal-induced exits (timeout=124, SIGINT=130, SIGKILL=137, SIGTERM=143)
     # mean the user (or `timeout`) cancelled this reviewer. Flag the run
     # so the orchestrator skips stages 2-4 and does NOT post a partial
-    # review. Natural reviewer failures are still passed through.
+    # review.
     case "$exit_code" in
       124|130|137|143) : > "$RUN_DIR/.cancelled" ;;
+      *)
+        # Natural failure (auth error like "Not logged in", crash, bad
+        # config). The output is NOT a review. Move stage-1 outputs out of
+        # the stage1/*.md glob that extract/consolidate/quick read, so a
+        # failed reviewer is never posted — only kept for diagnostics and
+        # the run logs. Resume sees the missing .md and re-runs it.
+        case "$out" in
+          */stage1/*.md) mv -f "$out" "$out.failed" 2>/dev/null || true ;;
+        esac ;;
     esac
   fi
   local end; end=$(date +%s)
   local elapsed=$(( end - start ))
-  local bytes; bytes=$(wc -c < "$out" 2>/dev/null | tr -d ' ')
+  # A natural stage-1 failure moved the output to "$out.failed".
+  local outfile="$out"; [ -f "$out" ] || outfile="$out.failed"
+  local bytes; bytes=$(wc -c < "$outfile" 2>/dev/null | tr -d ' ')
 
   find_new_transcript "$before" > "$tpath"
   rm -f "$before"

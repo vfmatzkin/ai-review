@@ -8,6 +8,17 @@ LIB="${AI_REVIEW_LIB:-$HOME/.local/share/ai-review/lib/common.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 
+# Don't emit a review built from a failed summary stage. If consolidate
+# (stage 3) exited non-zero it leaves the failure marker in stage3.md
+# (or no usable body). Keep that internal — the file + run logs — rather
+# than posting an error as a review. Exit non-zero so the run dir is
+# preserved and --status shows the failure.
+if [ ! -s "$RUN_DIR/stage3.md" ] || grep -q "reviewer exited non-zero" "$RUN_DIR/stage3.md"; then
+  echo "▸ summary stage failed — not posting (output kept at $RUN_DIR/stage3.md)" >&2
+  update_run_field skipped_reason "summary stage failed"
+  exit 1
+fi
+
 # Local mode: write findings to a local markdown file and exit.
 if [ "${AI_REVIEW_MODE:-pr}" = "local" ]; then
   LOCAL_REVIEW_DIR="$REPO_ROOT/.ai-review/reviews"
@@ -37,7 +48,7 @@ REVIEW_PAYLOAD="$RUN_DIR/review-payload.json"
 
 # Banner prepended to the review body. Override per-project by setting
 # AI_REVIEW_BANNER in <repo>/.ai-review/config. Set to empty string to disable.
-DEFAULT_BANNER='> **Automated review** from the `ai-review` pipeline.
+DEFAULT_BANNER='> **Automated review** from the [`ai-review`](https://github.com/vfmatzkin/ai-review) pipeline.
 > Findings are LLM-generated — apply judgment before acting on them.'
 BANNER="${AI_REVIEW_BANNER-$DEFAULT_BANNER}"
 export AI_REVIEW_BANNER_RESOLVED="$BANNER"

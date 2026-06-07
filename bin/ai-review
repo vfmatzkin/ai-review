@@ -1085,6 +1085,8 @@ fi
 
 # No-content guard: if every reviewer output is empty or "NONE", there's
 # nothing to post. Stages 2-4 would still run and emit an empty body.
+# Failed reviewers (e.g. "Not logged in") leave a *.md.failed diagnostic
+# instead of a *.md, so their error text never counts as content here.
 if ! $AUDIT && ! $LOCAL; then
   has_content=false
   for entry in "${TO_RUN[@]}"; do
@@ -1096,6 +1098,15 @@ if ! $AUDIT && ! $LOCAL; then
     break
   done
   if ! $has_content; then
+    # Distinguish "all clean, genuinely nothing to report" from "every
+    # reviewer failed". On failure post nothing, but exit non-zero so the
+    # run dir is preserved (resume after fixing the cause) and --status
+    # shows it failed. The failed output stays in stage1/*.md.failed.
+    if ls "$RUN_DIR"/stage1/*.md.failed >/dev/null 2>&1; then
+      echo "▸ no findings and one or more reviewers failed — nothing posted" >&2
+      echo "  output kept in $RUN_DIR/stage1/*.md.failed; re-run to resume" >&2
+      exit 1
+    fi
     echo "▸ no reviewer produced findings — nothing to post" >&2
     exit 0
   fi
