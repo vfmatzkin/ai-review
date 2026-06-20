@@ -30,7 +30,7 @@ write_stub() {
   cat > "$CROSS_MD" <<EOF
 # Cross-PR review history
 
-_$reason_
+_${reason}_
 EOF
   rm -rf "$TMP"
   echo "  • no cross-PR review data ($reason)" >&2

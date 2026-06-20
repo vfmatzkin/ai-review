@@ -38,7 +38,7 @@ write_stub() {
   cat > "$CI_MD" <<EOF
 # CI status
 
-_$reason_
+_${reason}_
 EOF
   echo "  • no CI data ($reason)" >&2
   exit 0

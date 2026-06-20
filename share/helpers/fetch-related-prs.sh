@@ -43,7 +43,7 @@ write_stub() {
   cat > "$REL_MD" <<EOF
 # Related PRs
 
-_$reason_
+_${reason}_
 EOF
   rm -rf "$TMP"
   echo "  • no related PRs ($reason)" >&2
