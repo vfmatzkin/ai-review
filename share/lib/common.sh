@@ -96,9 +96,22 @@ call_claude() {
     env_args+=(ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL")
   fi
 
+  # Per-reviewer wall-clock cap. GNU `timeout` isn't on macOS — fall back to
+  # `gtimeout` (coreutils), and if neither exists run uncapped with a one-time
+  # note rather than dying with exit 127.
+  local -a to_cmd=()
+  if command -v timeout >/dev/null 2>&1; then
+    to_cmd=(timeout "$secs")
+  elif command -v gtimeout >/dev/null 2>&1; then
+    to_cmd=(gtimeout "$secs")
+  elif [ -z "${_AIR_NO_TIMEOUT_WARNED:-}" ]; then
+    echo "  • note: no 'timeout'/'gtimeout' on PATH — running reviewers without a wall-clock cap (brew install coreutils to enable it)" >&2
+    export _AIR_NO_TIMEOUT_WARNED=1
+  fi
+
   local exit_code=0
   if env "${env_args[@]}" \
-    timeout "$secs" claude -p "$user" \
+    ${to_cmd[@]+"${to_cmd[@]}"} claude -p "$user" \
       --append-system-prompt "$sys" \
       --allowedTools "$allowed" \
       --disallowedTools 'WebSearch WebFetch Edit Write' \
@@ -108,19 +121,46 @@ call_claude() {
     exit_code=0
   else
     exit_code=$?
-    printf '\n_(reviewer exited non-zero — output may be partial)_\n' >> "$out"
-    # Signal-induced exits (timeout=124, SIGINT=130, SIGKILL=137, SIGTERM=143)
-    # mean the user (or `timeout`) cancelled this reviewer. Flag the run
-    # so the orchestrator skips stages 2-4 and does NOT post a partial
-    # review.
     case "$exit_code" in
-      124|130|137|143) : > "$RUN_DIR/.cancelled" ;;
+      124)
+        # Wall-clock timeout (NOT a user cancel). Rather than abort the whole
+        # run for one slow reviewer, resume ITS OWN conversation and ask it to
+        # wrap up with whatever it already gathered, giving a margin. The
+        # resume continues the same session (most recent for this profile),
+        # so it keeps all of its investigation context.
+        local wrap_secs="${AI_WRAP_TIMEOUT:-240}"
+        echo "  • [$name] timed out at ${secs}s — resuming to wrap up (margin ${wrap_secs}s)..." >&2
+        local -a wrap_to=()
+        if   command -v timeout  >/dev/null 2>&1; then wrap_to=(timeout "$wrap_secs")
+        elif command -v gtimeout >/dev/null 2>&1; then wrap_to=(gtimeout "$wrap_secs"); fi
+        local wrap_prompt="You have run out of time. STOP investigating now and write your review immediately, using only what you have already gathered. Do not start any new searches or tool calls. Output your findings in the required format; if you found nothing actionable, output the single line: NONE."
+        if env "${env_args[@]}" ${wrap_to[@]+"${wrap_to[@]}"} claude -p -c "$wrap_prompt" \
+             --allowedTools "$allowed" \
+             --disallowedTools 'WebSearch WebFetch Edit Write' \
+             --max-turns 6 \
+             < /dev/null > "$out" 2>&1
+        then
+          exit_code=0
+          printf '\n_(wrapped up after a %ss timeout)_\n' "$secs" >> "$out"
+        else
+          # The wrap-up itself failed/timed out: keep what we have but do NOT
+          # cancel the whole run — drop this one like a natural failure.
+          exit_code=$?
+          printf '\n_(reviewer timed out; wrap-up failed — output may be partial)_\n' >> "$out"
+          case "$out" in */stage1/*.md) mv -f "$out" "$out.failed" 2>/dev/null || true ;; esac
+        fi ;;
+      130|137|143)
+        # Genuine user/process signal (SIGINT/SIGKILL/SIGTERM) — abort the run
+        # so the orchestrator skips stages 2-4 and posts no partial review.
+        printf '\n_(reviewer cancelled — output may be partial)_\n' >> "$out"
+        : > "$RUN_DIR/.cancelled" ;;
       *)
         # Natural failure (auth error like "Not logged in", crash, bad
         # config). The output is NOT a review. Move stage-1 outputs out of
         # the stage1/*.md glob that extract/consolidate/quick read, so a
         # failed reviewer is never posted — only kept for diagnostics and
         # the run logs. Resume sees the missing .md and re-runs it.
+        printf '\n_(reviewer exited non-zero — output may be partial)_\n' >> "$out"
         case "$out" in
           */stage1/*.md) mv -f "$out" "$out.failed" 2>/dev/null || true ;;
         esac ;;
