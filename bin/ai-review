@@ -34,10 +34,36 @@
 #   ai-review --status all           # every recorded run
 #   ai-review --quick                # skip stages 2/3, single summary
 #   ai-review --keep                 # preserve /tmp run dir
+#   ai-review --push                 # post to GitHub immediately (skip local preview)
+#   ai-review --post                 # post the most recent unposted preview for this repo
+#   ai-review --pr 1234              # review a specific PR number (not current branch)
+#   ai-review --guidance guide.md    # inject a context/guidance file into every reviewer
+#
+# Default behaviour: run the full PR pipeline, save findings locally (no GitHub post).
+# Use --push to post immediately, or --post to post a previously saved preview.
 #
 # Reviewer interface: each script exposes
 #   <script> applies   # exit 0 iff this reviewer should run for the PR
 #   <script> run       # produce $RUN_DIR/stage1/<NAME>.md
+
+
+# --- per-repo gh account routing -------------------------------------------
+# Interactive shells often wrap `gh` in a function that picks a GitHub account
+# by repo location; scripts bypass shell functions, so honor an optional route
+# map instead: ~/.config/ai-review/gh-routes, one route per line:
+#   <path-prefix> <gh-config-dir>     (e.g. "~/Code/work ~/.config/gh-work")
+# First matching prefix wins. An explicit GH_CONFIG_DIR always takes priority.
+if [ -z "${GH_CONFIG_DIR:-}" ] && [ -f "$HOME/.config/ai-review/gh-routes" ]; then
+  while read -r _route_prefix _route_cfg; do
+    case "$_route_prefix" in ''|'#'*) continue ;; esac
+    _route_prefix="${_route_prefix/#\~/$HOME}"
+    case "$PWD/" in "${_route_prefix%/}/"*)
+      export GH_CONFIG_DIR="${_route_cfg/#\~/$HOME}"; break ;;
+    esac
+  done < "$HOME/.config/ai-review/gh-routes"
+  unset _route_prefix _route_cfg
+fi
+# ---------------------------------------------------------------------------
 
 set -euo pipefail
 
