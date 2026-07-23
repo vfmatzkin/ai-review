@@ -44,6 +44,58 @@ if [ "${AI_REVIEW_MODE:-pr}" = "local" ]; then
   exit 0
 fi
 
+# No-post mode: write a full preview to .ai-review/reviews/ and stop.
+# The run dir is kept (KEEP=true set by default when NO_POST=true) so
+# --post can find it later and call this script again without this guard.
+if [ "${AI_REVIEW_NO_POST:-0}" = "1" ]; then
+  LOCAL_REVIEW_DIR="$REPO_ROOT/.ai-review/reviews"
+  mkdir -p "$LOCAL_REVIEW_DIR"
+  STAMP="$(date +%Y-%m-%d-%H%M)"
+  BNAME="$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null | tr '/' '-' || echo "detached")"
+  OUT="$LOCAL_REVIEW_DIR/${STAMP}-${BNAME}-pr${PR_NUM}-preview.md"
+  # Summarise validated inline findings for the preview.
+  INLINE_SUMMARY=""
+  if [ -f "$RUN_DIR/stage2.json" ] && [ -f "$RUN_DIR/diff-lines.json" ]; then
+    INLINE_SUMMARY="$(python3 - "$RUN_DIR/stage2.json" "$RUN_DIR/diff-lines.json" <<'PY'
+import json, sys, os
+findings = json.load(open(sys.argv[1])).get("findings", [])
+valid = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
+lines = []
+for f in findings:
+    path = f.get("path", "")
+    line = f.get("line")
+    if not isinstance(line, int): continue
+    if path not in valid or line not in valid.get(path, []): continue
+    sev = {"blocker": "BLOCKER", "suggestion": "suggestion", "note": "note"}.get(
+        f.get("severity", "note"), "note")
+    lines.append(f"- `{path}:{line}` [{sev}] **{f.get('title','')}** — {f.get('body','')}")
+if lines:
+    print("\n## Inline findings (%d validated)\n" % len(lines) + "\n".join(lines))
+PY
+)"
+  fi
+  {
+    echo "# Review preview — PR #${PR_NUM} (${REPO_NAME})"
+    echo
+    echo "- Generated: $(date '+%Y-%m-%d %H:%M %Z')"
+    echo "- Branch: \`${BNAME}\`  base: \`${BASE_REF:-?}\`"
+    echo "- HEAD: \`${HEAD_SHA:0:7}\`"
+    echo "- Profile: \`${AI_CMD}\` (\`${AI_PROFILE_DIR}\`)"
+    [ -n "${AI_MODEL:-}" ] && echo "- Model: \`${AI_MODEL}\`"
+    [ -n "${AI_REVIEW_GUIDANCE_FILE:-}" ] && echo "- Guidance: \`${AI_REVIEW_GUIDANCE_FILE}\`"
+    echo
+    echo "---"
+    echo
+    cat "$RUN_DIR/stage3.md"
+    [ -n "$INLINE_SUMMARY" ] && printf '\n%s\n' "$INLINE_SUMMARY"
+  } > "$OUT"
+  update_run_field review_url "$OUT"
+  update_run_field status "no-post"
+  echo "▸ preview: $OUT" >&2
+  echo "  post when ready: ai-review --post" >&2
+  exit 0
+fi
+
 REVIEW_PAYLOAD="$RUN_DIR/review-payload.json"
 
 # Banner prepended to the review body. Override per-project by setting

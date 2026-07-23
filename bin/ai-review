@@ -89,6 +89,10 @@ STATUS_LIMIT=recent
 AUDIT=false
 LOCAL=false
 NO_RESUME=false
+NO_POST=true
+POST=false
+PR_NUM_OVERRIDE=""
+GUIDANCE_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --include) INCLUDE="$2"; shift 2 ;;
@@ -101,11 +105,16 @@ while [ $# -gt 0 ]; do
     --audit)   AUDIT=true; shift ;;
     --local)   LOCAL=true; shift ;;
     --no-resume) NO_RESUME=true; shift ;;
+    --no-post)  NO_POST=true; shift ;;
+    --push)     NO_POST=false; shift ;;
+    --post)     POST=true; shift ;;
+    --pr)       PR_NUM_OVERRIDE="$2"; shift 2 ;;
+    --guidance) GUIDANCE_FILE="$2"; shift 2 ;;
     --status)
       STATUS=true; shift
       if [ $# -gt 0 ]; then
         case "$1" in
-          all|latest|[0-9]*) STATUS_LIMIT="$1"; shift ;;
+          all|latest|pending|[0-9]*) STATUS_LIMIT="$1"; shift ;;
         esac
       fi
       ;;
@@ -117,6 +126,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Preserve run dir whenever we're not posting, so --post can find it later.
+if $NO_POST; then KEEP=true; fi
+
 if $QUICK && $AUDIT; then
   echo "ai-review: --quick and --audit cannot be combined." >&2
   echo "  --quick posts a PR comment; --audit writes a local file." >&2
@@ -124,6 +136,22 @@ if $QUICK && $AUDIT; then
 fi
 if $LOCAL && $AUDIT; then
   echo "ai-review: --local and --audit cannot be combined." >&2
+  exit 2
+fi
+if $NO_POST && $POST; then
+  echo "ai-review: --no-post and --post cannot be combined." >&2
+  exit 2
+fi
+if $POST && { $LOCAL || $AUDIT; }; then
+  echo "ai-review: --post cannot be combined with --local or --audit." >&2
+  exit 2
+fi
+if [ -n "$GUIDANCE_FILE" ] && [ ! -f "$GUIDANCE_FILE" ]; then
+  echo "ai-review: --guidance file not found: $GUIDANCE_FILE" >&2
+  exit 2
+fi
+if [ -n "$PR_NUM_OVERRIDE" ] && $LOCAL; then
+  echo "ai-review: --pr and --local cannot be combined." >&2
   exit 2
 fi
 
@@ -145,15 +173,23 @@ RECENT_WINDOW = 30 * 60
 if limit_arg == "all":
     limit = None
     recent_only = False
+    pending_only = False
 elif limit_arg == "recent":
     limit = None
     recent_only = True
+    pending_only = False
+elif limit_arg == "pending":
+    limit = None
+    recent_only = False
+    pending_only = True
 elif limit_arg == "latest":
     limit = 1
     recent_only = False
+    pending_only = False
 else:
     limit = int(limit_arg)
     recent_only = False
+    pending_only = False
 
 files = sorted(glob.glob(os.path.join(state_dir, "*.run")), key=os.path.getmtime, reverse=True)
 if not files:
@@ -222,20 +258,25 @@ for (owner, repo), entries in sorted_groups:
     entries.sort(key=lambda fd: int(fd[1].get("started","0") or 0), reverse=True)
     if limit is not None:
         entries = entries[:limit]
-    if recent_only:
+    if pending_only:
+        entries = [fd for fd in entries if fd[1].get("status") == "no-post"]
+    elif recent_only:
         cutoff = now - RECENT_WINDOW
         def keep(fd):
             d = fd[1]
             started = int(d.get("started", "0") or 0)
             is_running = d.get("status") == "running" and d.get("pid") and alive(d["pid"])
-            return is_running or started >= cutoff
+            is_pending = d.get("status") == "no-post"
+            return is_running or is_pending or started >= cutoff
         entries = [fd for fd in entries if keep(fd)]
     if entries:
         filtered_groups.append(((owner, repo), entries))
 
 if not filtered_groups:
-    if recent_only:
-        print("(no running runs and none in the last 30 min — try --status all)")
+    if pending_only:
+        print("(no pending (unposted) reviews — run: ai-review [--pr <num>] to create one)")
+    elif recent_only:
+        print("(no running or pending runs and none in the last 30 min — try --status all)")
     else:
         print("(no runs recorded)")
     sys.exit(0)
@@ -313,6 +354,11 @@ fi
 AI_CMD="${AI_CMD:-default}"
 AI_PROFILE_DIR="${AI_PROFILE_DIR:-$HOME/.claude}"
 AI_MODEL="${AI_MODEL:-}"
+# Optional per-stage model overrides. Stage-1 reviewers use AI_MODEL; the
+# mechanical extract (stage 2) and the summary (stage 3) can run on a
+# different model. Blank = fall back to AI_MODEL.
+AI_MODEL_STAGE2="${AI_MODEL_STAGE2:-}"
+AI_MODEL_STAGE3="${AI_MODEL_STAGE3:-}"
 AI_REVIEW_IDENTITY="${AI_REVIEW_IDENTITY:-auto}"
 AI_PRELAUNCH="${AI_PRELAUNCH:-}"
 
@@ -674,13 +720,17 @@ if $AUDIT; then
   BASE_SHA=""
 else
   if ! $LOCAL; then
-    PR_JSON="$(gh pr view --json number,title,body,baseRefName,headRefOid 2>/dev/null || true)"
-    if [ -z "$PR_JSON" ] && ! $LIST; then
+    if [ -n "$PR_NUM_OVERRIDE" ]; then
+      PR_JSON="$(gh pr view "$PR_NUM_OVERRIDE" --json number,title,body,baseRefName,headRefOid 2>/dev/null || true)"
+    else
+      PR_JSON="$(gh pr view --json number,title,body,baseRefName,headRefOid 2>/dev/null || true)"
+    fi
+    if [ -z "$PR_JSON" ] && ! $LIST && ! $POST; then
       if ! git remote get-url origin >/dev/null 2>&1; then
         echo "▸ no GitHub remote — using local review mode" >&2
         LOCAL=true
       else
-        echo "no open PR for current branch — push first (or use --audit for whole-repo)" >&2
+        echo "no open PR for current branch — push first, use --pr <num>, or use --audit for whole-repo" >&2
         exit 1
       fi
     fi
@@ -810,6 +860,8 @@ if ! $LIST; then
     echo "▸ audit (HEAD ${HEAD_SHA:0:7}) — writing local report (cmd: $AI_CMD)" >&2
   elif $LOCAL; then
     echo "▸ local review ($BASE_REF → ${HEAD_SHA:0:7}) — writing local report (cmd: $AI_CMD)" >&2
+  elif $NO_POST; then
+    echo "▸ PR #$PR_NUM ($BASE_REF → ${HEAD_SHA:0:7}) — preview only, no post (cmd: $AI_CMD)" >&2
   else
     echo "▸ PR #$PR_NUM ($BASE_REF → ${HEAD_SHA:0:7}) — posting as $IDENTITY (cmd: $AI_CMD)" >&2
   fi
@@ -935,11 +987,12 @@ fi
 
 # Export everything reviewer scripts need.
 export AI_REVIEW_LIB="$LIB"
-export AI_CMD AI_PROFILE_DIR AI_MODEL
+export AI_CMD AI_PROFILE_DIR AI_MODEL AI_MODEL_STAGE2 AI_MODEL_STAGE3
 export STATE_FILE
 export RUN_DIR REPO_ROOT REPO_OWNER REPO_NAME REPO_URL
 export PR_NUM BASE_REF BASE_SHA HEAD_SHA MODEL="$AI_MODEL"
 export LOCAL
+export AI_REVIEW_GUIDANCE_FILE="$GUIDANCE_FILE"
 # Mode flag for stage-1 reviewers and lib helpers that branch on PR vs audit.
 if $AUDIT; then
   export AI_REVIEW_MODE=audit
@@ -947,6 +1000,47 @@ elif $LOCAL; then
   export AI_REVIEW_MODE=local
 else
   export AI_REVIEW_MODE=pr
+fi
+
+# ------------------------------------------------------------------
+# --post: find last no-post preview for this repo and post it now.
+# ------------------------------------------------------------------
+if $POST; then
+  found_run=""
+  found_pr=""
+  found_state=""
+  latest_ts=0
+  for sf in "$STATE_DIR/${REPO_OWNER}__${REPO_NAME}__"*.run; do
+    [ -f "$sf" ] || continue
+    st=$(grep '^status=' "$sf" 2>/dev/null | cut -d= -f2 || echo "")
+    [ "$st" = "no-post" ] || continue
+    ts=$(grep '^started=' "$sf" 2>/dev/null | cut -d= -f2 || echo "0")
+    if [ "${ts:-0}" -gt "$latest_ts" ]; then
+      latest_ts="${ts:-0}"
+      found_run=$(grep '^run_dir=' "$sf" | cut -d= -f2)
+      found_pr=$(grep '^pr=' "$sf" | cut -d= -f2)
+      found_state="$sf"
+    fi
+  done
+  if [ -z "$found_run" ] || [ ! -d "$found_run" ] || [ ! -f "$found_run/stage3.md" ]; then
+    echo "ai-review: no pending preview found for $REPO_OWNER/$REPO_NAME" >&2
+    echo "  run: ai-review [--pr <num>] [--guidance <file>] --no-post" >&2
+    exit 1
+  fi
+  RUN_DIR="$found_run"
+  PR_NUM="$found_pr"
+  HEAD_SHA="$(cat "$RUN_DIR/head_sha" 2>/dev/null || echo "")"
+  STATE_FILE="$found_state"
+  export RUN_DIR PR_NUM HEAD_SHA STATE_FILE
+  echo "▸ posting preview: PR #$PR_NUM  HEAD ${HEAD_SHA:0:7}  dir $RUN_DIR" >&2
+  bash "$SHARE/pipeline/post-review.sh"
+  {
+    grep -v -E '^(status|ended|exit_code)=' "$STATE_FILE" || :
+    echo "ended=$(date +%s)"
+    echo "exit_code=0"
+    echo "status=done"
+  } > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  exit 0
 fi
 
 # Pre-stage-1 context fetches. These run BEFORE stage 1 so every
@@ -961,12 +1055,16 @@ fi
 if [ "$AI_REVIEW_MODE" != "audit" ]; then
   bash "$SHARE/helpers/fetch-ci-output.sh" || true
   bash "$SHARE/helpers/fetch-related-prs.sh" || true
+  # Mine the Claude Code conversation that built this branch into
+  # claude-chats.md (intent signal for the 06-intent-chat reviewer).
+  bash "$SHARE/helpers/fetch-claude-chats.sh" || true
 else
   # Audit mode: write stubs so reviewers can unconditionally Read these files.
   echo '[]' > "$RUN_DIR/ci-status.json"
   printf '# CI status\n\n_Audit mode — no diff, no CI fetch._\n' > "$RUN_DIR/ci-status.md"
   echo '{"files":[],"prs":[]}' > "$RUN_DIR/related-prs.json"
   printf '# Related PRs\n\n_Audit mode — no diff to query against._\n' > "$RUN_DIR/related-prs.md"
+  printf '# Claude Code build intent\n\n_Audit mode — no diff to anchor intent against._\n' > "$RUN_DIR/claude-chats.md"
 fi
 
 # ------------------------------------------------------------------
@@ -1215,7 +1313,11 @@ else
   fi
   bash "$SHARE/pipeline/extract-line-findings.sh"
   bash "$SHARE/pipeline/consolidate-summary.sh"
-  bash "$SHARE/pipeline/post-review.sh"
+  if $NO_POST; then
+    AI_REVIEW_NO_POST=1 bash "$SHARE/pipeline/post-review.sh"
+  else
+    bash "$SHARE/pipeline/post-review.sh"
+  fi
 fi
 
 # ------------------------------------------------------------------

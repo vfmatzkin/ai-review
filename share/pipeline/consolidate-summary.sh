@@ -8,6 +8,10 @@ LIB="${AI_REVIEW_LIB:-$HOME/.local/share/ai-review/lib/common.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 
+# Stage-3 writes the human-facing summary. Defaults to AI_MODEL (the
+# reviewer model); override to run the summary on a different model.
+[ -n "${AI_MODEL_STAGE3:-}" ] && MODEL="$AI_MODEL_STAGE3"
+
 STAGE1_DIR="$RUN_DIR/stage1"
 STAGE2_OUT="$RUN_DIR/stage2.json"
 OUT="$RUN_DIR/stage3.md"

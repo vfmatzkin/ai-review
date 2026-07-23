@@ -290,6 +290,12 @@ Use repo-relative paths. Line numbers refer to the NEW (post-change)
 file. Be terse. No bullet emoji. No preamble.
 EOF
   fi
+  # Caller-supplied guidance: appended to every reviewer's system prompt.
+  # Set AI_REVIEW_GUIDANCE_FILE to a path to inject project/PR-specific context.
+  if [ -n "${AI_REVIEW_GUIDANCE_FILE:-}" ] && [ -f "$AI_REVIEW_GUIDANCE_FILE" ]; then
+    printf '\n## Reviewer guidance\n\n'
+    cat "$AI_REVIEW_GUIDANCE_FILE"
+  fi
 }
 
 # Standard MCP tool surface for stage-1 reviewers (read-only research).

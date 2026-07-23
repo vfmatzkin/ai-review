@@ -8,6 +8,10 @@ LIB="${AI_REVIEW_LIB:-$HOME/.local/share/ai-review/lib/common.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 
+# Stage-2 is mechanical (prose findings -> strict JSON). A coder model is
+# faster and just as reliable here; reasoning is wasted. Override if set.
+[ -n "${AI_MODEL_STAGE2:-}" ] && MODEL="$AI_MODEL_STAGE2"
+
 # Compute (path, line) pairs that are postable as inline comments —
 # i.e. lines added (or in surrounding context) on the new side.
 python3 - "$RUN_DIR/pr.diff" > "$RUN_DIR/diff-lines.json" <<'PY'

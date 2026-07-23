@@ -6,3 +6,18 @@
 # Audit reports written by `ai-review --audit` are private working notes,
 # not source. Comment this line out to commit them.
 .ai-review/audits/
+
+# Local preview reports from `ai-review --no-post`. Private working notes.
+.ai-review/reviews/
+
+# Claude Code config-dir artifacts — land here if a CLAUDE_CONFIG_DIR (or a
+# `claude` run) is ever pointed at this repo. Never source; never commit.
+/projects/
+/backups/
+/shell-snapshots/
+/todos/
+/statsig/
+/.claude.json
+/.credentials.json
+/remote-settings.json
+/policy-limits.json
