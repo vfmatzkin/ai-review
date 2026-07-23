@@ -2,8 +2,9 @@
 
 Multi-stage AI pull-request reviewer. Drop a few bash scripts into a
 project, and `ai-review` runs them as separate angle-specific reviewers
-against the current PR's diff, line-anchors the findings, and posts one
-consolidated GitHub review.
+against the current PR's diff, line-anchors the findings, and produces
+one consolidated GitHub review — written as a local preview by default,
+or posted straight to the PR with `--push`.
 
 Designed to be:
 
@@ -16,8 +17,8 @@ Designed to be:
   project), or falls back to your `gh` login.
 
 Drives the [Claude Code](https://docs.claude.com/en/docs/claude-code/)
-CLI under the hood. If you've configured `claude` to talk to a non-
-Anthropic backend (Bedrock, Vertex, a custom adapter, etc.),
+CLI under the hood. If you've configured `claude` to talk to a
+non-Anthropic backend (Bedrock, Vertex, a custom adapter, etc.),
 ai-review uses whatever profile you point it at.
 
 ## Install
@@ -51,53 +52,24 @@ setup that walks through:
    for project-specific tweaking, or run with the globals as-is
 4. **Hook hint** — a pre-push lefthook stanza you can paste in
 
-Every subsequent invocation skips setup and runs the pipeline.
+Every subsequent invocation skips setup and runs the pipeline. By
+default a run writes a local **preview** to `<repo>/.ai-review/reviews/`;
+add `--push` to post it straight to the PR, or run `--post` later to
+publish a preview you've already generated.
 
 To re-enter the wizard later: `ai-review --init`.
 
 ## How it works
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Pre-stage: orchestrator-fetched cross-cutting context               │
-│    pr.diff, pr-meta.md (PR description),                             │
-│    ci-status.md (latest GitHub Actions runs for HEAD_SHA),           │
-│    related-prs.md (last few merged PRs that touched the same files)  │
-│  Reviewers Read these on demand — read what helps your focus.        │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────────────┐
-│  Stage 1: each reviewer (sequential, scoped tool surface, 5 angles)  │
-│    01-runtime-truth  → empirical (build/test + CI)                   │
-│    02-architecture   → static structure + layer discipline           │
-│    03-dryness        → DRY / SOLID / dead code / rewrite cycles      │
-│    04-risk           → adversarial: failure modes + security         │
-│    05-intent         → diff vs PR description vs spec vs cross-PR    │
-│    NN-<your name>    → project-specific additions / overrides        │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────────────┐
-│  Past-reviews fetch — prior bot reviews on this PR + this bot's      │
-│  reviews on OTHER recent PRs. Runs AFTER stage 1 so reviewers form   │
-│  findings without bias from prior runs.                              │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────────────┐
-│  Stage 2: extract — synthesize line-anchored findings as JSON        │
-│           Drops findings off-diff or duplicating prior reviews.      │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────────────┐
-│  Stage 3: consolidate — write the prose summary body                 │
-│           Opens with "Builds on …" link list when prior reviews exist│
-│           Adds a "## Patterns" section when cross-pr-reviews.md      │
-│           shows the bot has flagged the same concern across N PRs.   │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────────────┐
-│  Stage 4: post — atomic POST to GitHub Reviews API                   │
-│           Skipped entirely if 0 new findings AND a prior review existed.│
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["<b>Pre-stage context</b> · orchestrator-fetched<br/>pr.diff · pr-meta.md · ci-status.md<br/>related-prs.md · claude-chats.md<br/><i>reviewers Read these on demand</i>"]
+    B["<b>Stage 1 — reviewers</b> · sequential, scoped tool surface<br/>runtime-truth · architecture · dryness<br/>risk · intent · intent-chat<br/>NN-your-own → project additions / overrides"]
+    C["<b>Past-reviews fetch</b><br/>prior bot reviews on this PR +<br/>this bot's reviews on other recent PRs<br/><i>runs after stage 1 so findings form unbiased</i>"]
+    D["<b>Stage 2 — extract</b><br/>synthesize line-anchored findings as JSON<br/>drops off-diff or already-raised findings"]
+    E["<b>Stage 3 — consolidate</b><br/>write the prose summary body<br/>'Builds on …' link list + '## Patterns' when relevant"]
+    F["<b>Stage 4 — post</b><br/>atomic POST to the GitHub Reviews API<br/>skipped by --no-post (default) / --local / --audit,<br/>or when 0 new findings and a prior review exists"]
+    A --> B --> C --> D --> E --> F
 ```
 
 Why multi-stage rather than one shot:
@@ -120,13 +92,21 @@ Why multi-stage rather than one shot:
 
 | Command | Purpose |
 |---|---|
-| `ai-review` | Run the PR-review pipeline. First time in a repo → wizard. |
+| `ai-review` | Run the PR-review pipeline. First time in a repo → wizard. Writes a local preview by default. |
+| `ai-review --push` | Post the review straight to the PR instead of writing a preview. |
+| `ai-review --no-post` | Force preview-only (the default): write to `<repo>/.ai-review/reviews/`, don't post. |
+| `ai-review --post` | Post the most recent preview for this repo (after a `--no-post` run). |
+| `ai-review --pr N` | Review PR number N instead of the current branch's PR. |
+| `ai-review --local` | Review the local diff with no PR → local report. |
+| `ai-review --no-resume` | Start fresh instead of resuming an interrupted run for the same PR + HEAD. |
+| `ai-review --guidance FILE` | Append FILE to every reviewer's system prompt (project/PR-specific context). |
 | `ai-review --audit` | Whole-repo audit → markdown report at `<repo>/.ai-review/audits/`. |
 | `ai-review --init` | Re-enter the wizard. |
 | `ai-review --list` | Show discovered reviewers (project + global). |
 | `ai-review --status` | Run table — running runs + anything from the last 30 minutes. |
 | `ai-review --status latest` | Most recent run per repo. |
 | `ai-review --status N` | Last N runs per repo. |
+| `ai-review --status pending` | Unposted previews awaiting `--post`. |
 | `ai-review --status all` | Every recorded run. |
 | `ai-review --include foo,bar` | Force-include reviewers `foo` and `bar`. |
 | `ai-review --exclude runtime-test` | Skip a reviewer. |
@@ -138,12 +118,12 @@ Why multi-stage rather than one shot:
 
 Discovery order, by basename:
 
-```
+```text
 <repo>/.ai-review/reviewers/*.sh         # project-specific (overrides)
 ~/.local/share/ai-review/reviewers.default/*.sh   # globals
 ```
 
-The included global defaults — five complementary angles, no overlap
+The included global defaults — six complementary angles, no overlap
 by design (test-coverage gaps fold into each angle's own focus area
 rather than living in a separate `tests` reviewer):
 
@@ -154,6 +134,7 @@ rather than living in a separate `tests` reviewer):
 | `03-dryness.sh` | DRY violations across files, dead code, rewrite cycles via code_archaeology | diff touches a code file |
 | `04-risk.sh` | adversarial: failure modes (races, cleanup, cancellation, panic safety) + security (injection, secrets, traversal) | any non-empty diff |
 | `05-intent.sh` | diff vs PR description vs project docs (AGENTS.md / CONTRIBUTING / specs); cross-PR drift via `related-prs.md` | any non-empty diff |
+| `06-intent-chat.sh` | build intent: diff vs what you actually asked for in the Claude Code session that produced it, via `claude-chats.md` | non-empty diff AND a chat digest was found |
 
 Defaults are **language-agnostic, Python-first** — they recognize
 Python (`pyproject.toml` + pytest) out of the box and have concrete
@@ -176,7 +157,7 @@ To write your own from scratch, see
 
 Two config layers, plus inline env-var override:
 
-```
+```text
 inline env  >  <repo>/.ai-review/config  >  ~/.config/ai-review/config
 ```
 
@@ -192,7 +173,9 @@ Knobs:
 |---|---|---|
 | `AI_PROFILE_DIR` | `CLAUDE_CONFIG_DIR` for this run | `~/.claude` |
 | `AI_CMD` | Logical label (shown in logs / status) | `default` |
-| `AI_MODEL` | `ANTHROPIC_MODEL` override | (none — let Claude pick) |
+| `AI_MODEL` | Model override for the reviewers | (none — let Claude pick) |
+| `AI_MODEL_STAGE2` | Model override for the stage-2 extract (mechanical JSON) | (none — use `AI_MODEL`) |
+| `AI_MODEL_STAGE3` | Model override for the stage-3 summary | (none — use `AI_MODEL`) |
 | `AI_TIMEOUT` | Per-reviewer timeout in seconds | `600` |
 | `AI_PRELAUNCH` | Shell command run before the first reviewer | (none) |
 | `AI_REVIEW_IDENTITY` | `auto` / `app` / `gh-user` | `auto` |
@@ -205,7 +188,7 @@ ai-review can post under a per-repo GitHub App so reviews come from a
 named bot account (`my-review-bot[bot]`) rather than your personal
 identity. App config lives at:
 
-```
+```text
 ~/.config/ai-review/apps/<owner>__<repo>.{conf,pem}
 ```
 
@@ -225,7 +208,7 @@ designed for, install:
 
 | MCP server | What it adds | Repo |
 |---|---|---|
-| `claude-review-mcp` | `audit_pr`, `research_project`, `find_examples_of`, `read_with_question`, `code_archaeology`, `compare_files` — focused review/research tools each in an isolated subprocess | <https://github.com/vfmatzkin/claude-review-mcp> |
+| `claude-review-mcp` | `audit_pr`, `research_project`, `find_examples_of`, `read_with_question`, `code_archaeology`, `compare_files` — focused review/research tools each in an isolated subprocess | <https://github.com/vfmatzkin/claude-review> |
 | `brave-search` | Web search inside the reviewer (useful for "is this CVE still live", library version checks) | community MCP |
 | `context7` | Live library documentation lookups (better than relying on training-data knowledge of API surfaces) | community MCP |
 
@@ -267,7 +250,7 @@ plain `git push` skips it.
 
 ## Status
 
-```
+```text
 $ ai-review --status
 REPO                          PR  STATUS      STARTED            TOTAL  LINK
 ----------------------------------------------------------------------------
